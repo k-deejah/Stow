@@ -13,9 +13,7 @@ import { IndexerMetricsDto } from './dto/indexer-metrics.dto';
 import { BackfillResponseDto } from './dto/backfill.dto';
 import { ReconciliationService } from './reconciliation.service';
 import { SorobanService } from '../soroban/soroban.service';
-import { GoalsService } from '../goals/goals.service';
-import { BalanceService } from '../savings/balance.service';
-import { NotificationGeneratorService } from '../notifications/notification-generator.service';
+import { SavingsProjectionService } from '../savings-projection/savings-projection.service';
 
 export const CHECKPOINT_LEDGER_KEY = 'indexer:last_processed_ledger';
 const CHECKPOINT_LEDGER_KEY_LATEST = 'indexer:latest_contract_ledger';
@@ -25,14 +23,8 @@ const BACKFILL_MAX_PAGES = 1000;
 
 /**
  * Indexes on-chain events emitted by the Stow savings-vault contract into the
- * `contract_events` store, and exposes read/replay/metrics APIs.
- *
- * This is a **skeleton** after the pivot from the prediction market: the
- * generic event-store, checkpointing, retry, and metrics machinery is kept and
- * working, but the per-event decoding of savings events (deposit, withdraw,
- * locked_created, goal_reached, group_settled, ...) is stubbed.
- *
- * TODO(issue): implement `decodeAndApply` for each savings-vault event topic.
+ * `contract_events` store, applies them to the savings projections via
+ * `SavingsProjectionService`, and exposes read/replay/metrics APIs.
  */
 @Injectable()
 export class IndexerService implements OnModuleInit {
@@ -53,9 +45,7 @@ export class IndexerService implements OnModuleInit {
     private readonly checkpointRepository: Repository<IndexerCheckpoint>,
     private readonly reconciliationService: ReconciliationService,
     private readonly sorobanService: SorobanService,
-    private readonly goalsService: GoalsService,
-    private readonly balanceService: BalanceService,
-    private readonly notificationGeneratorService: NotificationGeneratorService,
+    private readonly savingsProjectionService: SavingsProjectionService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -174,61 +164,14 @@ export class IndexerService implements OnModuleInit {
 
   /**
    * Decode a savings-vault event and apply its side effects (update savings
-   * balances, mark goals reached, record group settlements, etc.).
-   *
-   * TODO(issue): implement remaining handlers (withdraw, locked_created,
-   * group_settled) matching the contract's events.
+   * balances, mark goals reached, record group settlements, etc.) via the
+   * shared savings-projection service.
    */
   private async decodeAndApply(event: ContractEvent): Promise<void> {
-    const data = event.data ?? {};
-
-    switch (event.event_type) {
-      case 'goal_created': {
-        await this.goalsService.upsertCreated({
-          onChainId: String(data.goal_id),
-          owner: String(data.owner),
-          name: data.name ? String(data.name) : '',
-          targetAmount: String(data.target_amount),
-        });
-        break;
-      }
-
-      case 'goal_contributed': {
-        const goal = await this.goalsService.applyContribution(
-          String(data.goal_id),
-          String(data.amount),
-        );
-        if (BigInt(goal.current_amount) >= BigInt(goal.target_amount)) {
-          await this.markGoalReachedAndNotify(goal.on_chain_id);
-        }
-        break;
-      }
-
-      case 'goal_reached': {
-        await this.markGoalReachedAndNotify(String(data.goal_id));
-        break;
-      }
-
-      case 'deposit': {
-        const account = data.user ?? data.account;
-        await this.balanceService.credit(String(account), String(data.amount));
-        break;
-      }
-
-      default:
-        break;
-    }
-  }
-
-  private async markGoalReachedAndNotify(onChainId: string): Promise<void> {
-    const { goal, changed } = await this.goalsService.markReached(onChainId);
-    if (!changed) return;
-    await this.notificationGeneratorService.handleGoalReached({
-      goalId: goal.on_chain_id,
-      owner: goal.owner,
-      name: goal.name,
-      targetAmount: goal.target_amount,
-    });
+    await this.savingsProjectionService.apply(
+      event.event_type,
+      event.data ?? {},
+    );
   }
 
   // --- replay / maintenance ----------------------------------------------

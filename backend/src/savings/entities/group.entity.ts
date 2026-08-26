@@ -7,13 +7,8 @@ import {
 } from 'typeorm';
 
 /**
- * A group savings pool projected from the vault contract's `group_created`,
- * `group_joined`, `group_contribution`, and `group_closed` events.
- *
- * `members` is a Postgres `text[]` of Stellar account addresses so
- * membership can be queried with `WHERE :address = ANY(members)`. The
- * migration creates a GIN index on this column (a plain btree `@Index`
- * here would not support that access pattern efficiently).
+ * A group savings pool projected from the vault contract's `group_created`
+ * and `group_split_settled` events.
  */
 @Entity('groups')
 export class Group {
@@ -24,24 +19,15 @@ export class Group {
   @Column({ type: 'varchar', unique: true })
   on_chain_id: string;
 
-  /** Stellar account address of the group creator. */
-  @Column({ type: 'varchar' })
-  creator: string;
-
-  @Column({ type: 'varchar' })
-  name: string;
-
-  /** Stellar account addresses of current group members. */
-  @Column({ type: 'text', array: true, default: () => "'{}'::text[]" })
-  members: string[];
-
-  /** Pooled balance, in stroops (kept as a string to avoid JS precision loss). */
+  /** Total pooled balance, in stroops, kept as a string to avoid precision loss. */
   @Column({ type: 'varchar', default: '0' })
   balance: string;
 
-  /** Whether the group is still accepting new members. */
-  @Column({ type: 'boolean', default: true })
-  open: boolean;
+  @Column({ type: 'boolean', default: false })
+  settled: boolean;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  settled_at: Date | null;
 
   @CreateDateColumn()
   created_at: Date;

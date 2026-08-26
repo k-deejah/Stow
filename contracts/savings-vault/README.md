@@ -13,6 +13,8 @@ frontend) can build against it without reading the stub bodies.
 - [Module → issue map](#module--issue-map)
 - [Layout](#layout)
 - [Build & test](#build--test)
+- [Wasm size budget & optimization](#wasm-size-budget--optimization)
+- [Testnet deployment](#testnet-deployment)
 - [Entrypoint reference](#entrypoint-reference)
 - [Event schema](#event-schema)
 
@@ -58,6 +60,52 @@ cargo test           # placeholder tests are #[ignore]d until implemented
 > runtime until a contributor implements them. The signatures, auth rules,
 > errors, and events below are the contract this crate implements against;
 > implementations must not deviate from them without updating this doc.
+
+## Wasm size budget & optimization
+
+CI builds the release wasm, runs `stellar contract optimize` against it, and
+fails the build if the **optimized** wasm exceeds a size budget. This catches
+size regressions before they reach a deployed contract.
+
+The current budget is `65536` bytes (64 KiB), set via `WASM_SIZE_BUDGET_BYTES`
+in the `savings-vault` job's `env:` block in
+[`.github/workflows/contract-ci.yml`](../../.github/workflows/contract-ci.yml).
+Raise it only alongside a deliberate decision to accept the size increase —
+e.g. a new savings mechanism or a larger dependency — not as a routine fix
+for a failing build.
+
+To check locally:
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+stellar contract optimize \
+  --wasm target/wasm32-unknown-unknown/release/savings_vault.wasm \
+  --wasm-out target/wasm32-unknown-unknown/release/savings_vault.optimized.wasm
+wc -c target/wasm32-unknown-unknown/release/savings_vault.optimized.wasm
+```
+
+## Testnet deployment
+
+[`scripts/deploy_testnet.sh`](scripts/deploy_testnet.sh) builds, deploys, and
+initializes the vault on Stellar testnet in one command, then prints the
+deployed contract id:
+
+```bash
+SOURCE_ACCOUNT=alice ./scripts/deploy_testnet.sh
+```
+
+`SOURCE_ACCOUNT` must name a funded Stellar CLI identity (create one with
+`stellar keys generate --fund --network testnet alice`). By default the
+script wraps native XLM as the vault's token, since it's always available on
+testnet with no setup. Env vars:
+
+| Var | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `SOURCE_ACCOUNT` | yes | — | Identity that deploys, pays fees, and becomes admin unless overridden. |
+| `ADMIN_ACCOUNT` | no | `SOURCE_ACCOUNT`'s address | Address set as the vault admin. |
+| `TOKEN_CONTRACT_ID` | no | — | Use an already-deployed SEP-41 token instead of wrapping an asset. |
+| `TEST_ASSET` | no | `native` | Classic asset to wrap as the vault's token, as `CODE:ISSUER`. |
+| `STELLAR_NETWORK` | no | `testnet` | Network passed to the Stellar CLI. |
 
 ---
 
@@ -115,11 +163,35 @@ stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
   -- set_admin --new_admin GNEWADMIN...ADDRESS
 ```
 
+#### `deposit_cap() -> i128`
+- **Auth:** none (read-only).
+- **Returns:** the current per-account deposit cap, in token stroops. `0`
+  means unlimited (the default before `set_deposit_cap` is ever called).
+- **Errors:** none.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- deposit_cap
+```
+
+#### `set_deposit_cap(cap: i128) -> Result<(), Error>`
+- **Auth:** current admin.
+- **Errors:** `NotInitialized`, `InvalidAmount` if `cap < 0`.
+- Takes effect immediately — the next `deposit` call is checked against the
+  new value.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- set_deposit_cap --cap 1000000000
+```
+
 ### Flexible savings — deposit / withdraw any time
 
 #### `deposit(from: Address, amount: i128) -> Result<(), Error>`
 - **Auth:** `from`.
-- **Errors:** `InvalidAmount` if `amount <= 0`, `NotInitialized`.
+- **Errors:** `InvalidAmount` if `amount <= 0`, `NotInitialized`,
+  `DepositCapExceeded` if the admin-configured per-account cap
+  (`deposit_cap`, set via `set_deposit_cap`) is non-zero and the resulting
+  balance would exceed it, `Overflow` if the resulting balance would not
+  fit in `i128`.
 - **Events:** [`deposit`](#deposit).
 ```bash
 stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
@@ -129,7 +201,8 @@ stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
 #### `withdraw(owner: Address, amount: i128) -> Result<(), Error>`
 - **Auth:** `owner`.
 - **Errors:** `NotFound` if no account exists for `owner`, `InvalidAmount`,
-  `InsufficientBalance` if `amount` exceeds the account balance.
+  `InsufficientBalance` if `amount` exceeds the account balance, `Overflow`
+  (defensive; unreachable in practice since the balance check runs first).
 - **Events:** [`withdraw`](#withdraw).
 ```bash
 stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
@@ -160,7 +233,8 @@ stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
 #### `locked_top_up(owner: Address, plan_id: u64, amount: i128) -> Result<(), Error>`
 - **Auth:** `owner`.
 - **Errors:** `NotFound`, `Unauthorized` if `owner` does not own `plan_id`,
-  `InvalidAmount`.
+  `InvalidAmount`, `Overflow` if the resulting balance would not fit in
+  `i128`.
 - **Events:** [`locked_top_up`](#locked_top_up).
 ```bash
 stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
@@ -169,8 +243,11 @@ stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
 
 #### `locked_withdraw(owner: Address, plan_id: u64, amount: i128) -> Result<(), Error>`
 - **Auth:** `owner`.
-- **Errors:** `NotFound`, `Unauthorized`, `StillLocked` if `now < unlock_at`,
-  `InsufficientBalance`, `InvalidAmount`.
+- **Errors:** `NotFound`, `Unauthorized`, `InsufficientBalance` (checked
+  before `StillLocked` so callers get the more actionable error when both
+  conditions hold), `StillLocked` if `now < unlock_at`, `InvalidAmount`,
+  `Overflow` (defensive; unreachable in practice since the balance check
+  runs first).
 - **Events:** [`locked_withdraw`](#locked_withdraw).
 ```bash
 stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
@@ -305,7 +382,8 @@ stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
 
 #### `group_settle(caller: Address, group_id: u64) -> Result<(), Error>`
 - **Auth:** `caller` — permissionless once shares are set.
-- **Errors:** `NotFound`, `InvalidShares` if shares were never configured.
+- **Errors:** `NotFound`, `InvalidShares` if shares were never configured,
+  `Overflow` if a per-member share computation would not fit in `i128`.
 - **Events:** [`group_split_settled`](#group_split_settled), once per member.
 ```bash
 stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \

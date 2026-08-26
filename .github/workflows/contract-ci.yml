@@ -42,6 +42,68 @@ jobs:
       - name: WASM Build
         run: cargo build --target wasm32-unknown-unknown --release
 
+  savings-vault:
+    name: Build, Lint, and Test savings-vault
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: contracts/savings-vault
+
+    env:
+      STELLAR_CLI_VERSION: "23.4.1"
+      # Budget for the optimized release WASM. Raise this only alongside a
+      # deliberate decision to accept the size increase — see the "Wasm size
+      # budget" section of this crate's README.
+      WASM_SIZE_BUDGET_BYTES: 65536
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "contracts/savings-vault -> target"
+
+      - name: Unit Tests
+        run: cargo test
+
+      - name: WASM Build
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Cache Stellar CLI
+        id: cache-stellar-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/stellar
+          key: stellar-cli-${{ runner.os }}-${{ env.STELLAR_CLI_VERSION }}
+
+      - name: Install Stellar CLI
+        if: steps.cache-stellar-cli.outputs.cache-hit != 'true'
+        run: cargo install --locked stellar-cli --version "${{ env.STELLAR_CLI_VERSION }}"
+
+      - name: Optimize WASM
+        run: |
+          stellar contract optimize \
+            --wasm target/wasm32-unknown-unknown/release/savings_vault.wasm \
+            --wasm-out target/wasm32-unknown-unknown/release/savings_vault.optimized.wasm
+
+      - name: Check WASM size budget
+        run: |
+          size=$(wc -c < target/wasm32-unknown-unknown/release/savings_vault.optimized.wasm)
+          echo "Optimized WASM size: ${size} bytes (budget: ${WASM_SIZE_BUDGET_BYTES} bytes)" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$size" -gt "$WASM_SIZE_BUDGET_BYTES" ]; then
+            echo "::error::Optimized WASM size ${size} bytes exceeds budget of ${WASM_SIZE_BUDGET_BYTES} bytes"
+            exit 1
+          fi
+
   creator-event-manager:
     name: Build, Lint, and Test creator-event-manager
     runs-on: ubuntu-latest

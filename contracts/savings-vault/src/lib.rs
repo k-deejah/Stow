@@ -50,6 +50,30 @@ impl SavingsVault {
         admin::set_admin(&env, new_admin)
     }
 
+    pub fn admin(env: Env) -> Result<Address, Error> {
+        admin::admin(&env)
+    }
+
+    /// Pause or unpause the vault. Admin-only. While paused, mutating
+    /// entrypoints reject with `Error::Paused`; reads remain available.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), Error> {
+        admin::set_paused(&env, caller, paused)
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        admin::is_paused(&env)
+    }
+
+    /// Per-account deposit cap, in token stroops. `0` means unlimited.
+    pub fn deposit_cap(env: Env) -> i128 {
+        admin::deposit_cap(&env)
+    }
+
+    /// Set the per-account deposit cap. Admin-only; `0` disables the cap.
+    pub fn set_deposit_cap(env: Env, cap: i128) -> Result<(), Error> {
+        admin::set_deposit_cap(&env, cap)
+    }
+
     // --- flexible ----------------------------------------------------------
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<(), Error> {
         flexible::deposit(&env, from, amount)

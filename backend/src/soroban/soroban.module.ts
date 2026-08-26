@@ -4,10 +4,15 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { SorobanService } from './soroban.service';
 import { SorobanListener } from './soroban.listener';
 import { SystemState } from './entities/system-state.entity';
+import { SavingsProjectionModule } from '../savings-projection/savings-projection.module';
 
 @Global()
 @Module({
-  imports: [ConfigModule, TypeOrmModule.forFeature([SystemState])],
+  imports: [
+    ConfigModule,
+    TypeOrmModule.forFeature([SystemState]),
+    SavingsProjectionModule,
+  ],
   providers: [SorobanService, SorobanListener],
   exports: [SorobanService],
 })

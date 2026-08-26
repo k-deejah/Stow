@@ -11,9 +11,7 @@ import { IndexerController } from './indexer.controller';
 import { IndexerHealthController } from './indexer-health.controller';
 import { IndexerHealthService } from './health.service';
 import { ReconciliationService } from './reconciliation.service';
-import { GoalsModule } from '../goals/goals.module';
-import { SavingsModule } from '../savings/savings.module';
-import { NotificationsModule } from '../notifications/notifications.module';
+import { SavingsProjectionModule } from '../savings-projection/savings-projection.module';
 
 @Module({
   imports: [
@@ -25,9 +23,7 @@ import { NotificationsModule } from '../notifications/notifications.module';
       ReorgEvent,
     ]),
     CacheModule.register(),
-    GoalsModule,
-    SavingsModule,
-    NotificationsModule,
+    SavingsProjectionModule,
   ],
   controllers: [IndexerController, IndexerHealthController],
   providers: [IndexerService, IndexerHealthService, ReconciliationService],
