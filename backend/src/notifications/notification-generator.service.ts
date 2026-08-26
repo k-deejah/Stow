@@ -3,6 +3,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Notification, NotificationType } from './entities/notification.entity';
 import { NotificationsService } from './notifications.service';
+import { User } from '../users/entities/user.entity';
+import { UserPreferences } from '../users/entities/user-preferences.entity';
 
 /**
  * Turns domain events into user notifications.
@@ -20,22 +22,61 @@ export class NotificationGeneratorService {
   constructor(
     @InjectRepository(Notification)
     private readonly notificationsRepository: Repository<Notification>,
+    @InjectRepository(User)
+    private readonly userRepository: Repository<User>,
+    @InjectRepository(UserPreferences)
+    private readonly userPreferencesRepository: Repository<UserPreferences>,
     private readonly notificationsService: NotificationsService,
   ) {}
 
-  /** A savings goal reached its target. */
+  /**
+   * A savings goal reached its target.
+   *
+   * Delivery rules:
+   * 1. Look up the owner's User row by Stellar address to obtain their UUID.
+   *    If no account exists (e.g. address not yet registered) we fall back to
+   *    address-only delivery so the notification is never silently dropped.
+   * 2. When a UUID is found, check `UserPreferences.goal_reached_notifications`.
+   *    If the user has opted out we skip creating the notification entirely.
+   * 3. Pass the UUID to `NotificationsService.create` so quiet-hours and
+   *    frequency (INSTANT / HOURLY / DAILY) preferences are respected.
+   */
   async handleGoalReached(data: {
     goalId: string;
     owner: string;
     name: string;
     targetAmount: string;
   }): Promise<void> {
+    // --- 1. Resolve the user UUID from their Stellar address ----------------
+    const user = await this.userRepository.findOne({
+      where: { stellar_address: data.owner },
+    });
+
+    // --- 2. Respect the goal_reached_notifications opt-out preference -------
+    if (user) {
+      const prefs = await this.userPreferencesRepository.findOne({
+        where: { userId: user.id },
+      });
+      if (prefs && !prefs.goal_reached_notifications) {
+        this.logger.debug(
+          `handleGoalReached: user ${user.id} has opted out of goal_reached notifications; skipping`,
+        );
+        return;
+      }
+    }
+
+    // --- 3. Create the notification, routing via user preferences when known -
     await this.notificationsService.create(
       data.owner,
       NotificationType.GoalReached,
-      'Savings goal reached',
-      `Your goal "${data.name}" reached its target of ${data.targetAmount}.`,
+      'Savings goal reached! 🎯',
+      `Your goal "${data.name}" has reached its target of ${data.targetAmount} stroops. Well done!`,
       { goal_id: data.goalId, target_amount: data.targetAmount },
+      user?.id,
+    );
+
+    this.logger.log(
+      `handleGoalReached: notification created for owner=${data.owner} goal=${data.goalId}`,
     );
   }
 
