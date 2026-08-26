@@ -14,8 +14,9 @@ use soroban_sdk::{
     Address, Env, Map, String,
 };
 
-use crate::{SavingsVault, SavingsVaultClient};
 use crate::error::Error;
+use crate::group_split;
+use crate::{SavingsVault, SavingsVaultClient};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -186,9 +187,90 @@ fn goal_claim_after_reached_returns_funds() {
     assert_eq!(result, Err(Ok(Error::NotFound)));
 }
 
+/// Closing a group, assigning shares, and settling pays each member their
+/// bps-weighted portion of the pooled contributions and fully drains the
+/// group balance. Shares (34%/33%/33%) don't divide the pool evenly, so this
+/// also exercises the rule that the creator (first member) absorbs the
+/// rounding remainder.
 #[test]
-#[ignore = "TODO(issue): group_split settle pays members by shares and drains pool"]
-fn group_split_settles_by_shares() {}
+fn group_split_settles_by_shares() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let member_b = Address::generate(&env);
+    let member_c = Address::generate(&env);
+
+    const CREATOR_CONTRIB: i128 = 50_000_000;
+    const MEMBER_B_CONTRIB: i128 = 30_000_000;
+    const MEMBER_C_CONTRIB: i128 = 20_000_000;
+    const TOTAL: i128 = CREATOR_CONTRIB + MEMBER_B_CONTRIB + MEMBER_C_CONTRIB;
+
+    mint(&env, &token, &token_admin, &creator, CREATOR_CONTRIB);
+    mint(&env, &token, &token_admin, &member_b, MEMBER_B_CONTRIB);
+    mint(&env, &token, &token_admin, &member_c, MEMBER_C_CONTRIB);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "split-pool"));
+    client.group_join(&member_b, &group_id);
+    client.group_join(&member_c, &group_id);
+
+    client.group_contribute(&creator, &group_id, &CREATOR_CONTRIB);
+    client.group_contribute(&member_b, &group_id, &MEMBER_B_CONTRIB);
+    client.group_contribute(&member_c, &group_id, &MEMBER_C_CONTRIB);
+
+    client.group_close(&creator, &group_id);
+
+    let mut shares = Map::new(&env);
+    shares.set(creator.clone(), 3_334u32); // 33.34%
+    shares.set(member_b.clone(), 3_333u32); // 33.33%
+    shares.set(member_c.clone(), 3_333u32); // 33.33%
+    client.group_set_shares(&creator, &group_id, &shares);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let creator_before = token_client.balance(&creator);
+    let member_b_before = token_client.balance(&member_b);
+    let member_c_before = token_client.balance(&member_c);
+
+    client.group_settle(&creator, &group_id);
+
+    let creator_after = token_client.balance(&creator);
+    let member_b_after = token_client.balance(&member_b);
+    let member_c_after = token_client.balance(&member_c);
+
+    let member_b_payout = TOTAL * 3_333 / group_split::TOTAL_BPS as i128;
+    let member_c_payout = TOTAL * 3_333 / group_split::TOTAL_BPS as i128;
+    let creator_floor_payout = TOTAL * 3_334 / group_split::TOTAL_BPS as i128;
+    let remainder = TOTAL - creator_floor_payout - member_b_payout - member_c_payout;
+
+    assert_eq!(
+        member_b_after - member_b_before,
+        member_b_payout,
+        "member B must receive their bps-weighted share"
+    );
+    assert_eq!(
+        member_c_after - member_c_before,
+        member_c_payout,
+        "member C must receive their bps-weighted share"
+    );
+    assert_eq!(
+        creator_after - creator_before,
+        creator_floor_payout + remainder,
+        "creator (first member) must receive their share plus the rounding remainder"
+    );
+
+    let payouts_sum = (creator_after - creator_before)
+        + (member_b_after - member_b_before)
+        + (member_c_after - member_c_before);
+    assert_eq!(
+        payouts_sum, TOTAL,
+        "payouts must exactly account for the whole pool"
+    );
+
+    let group = client.group(&group_id);
+    assert_eq!(group.balance, 0, "pool must be fully drained after settle");
+}
 
 // ---------------------------------------------------------------------------
 // Issue #40 — InsufficientBalance rejection
