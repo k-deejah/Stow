@@ -82,6 +82,8 @@ pub enum DataKey {
     /// Durability: instance, for the same reason as `Token`. TTL: same as
     /// `Token`.
     Admin,
+    /// Emergency-pause flag. Absent/false means unpaused.
+    Paused,
     /// Admin-configured per-account deposit cap, in token stroops. Absent
     /// (or `0`) means unlimited. See [`crate::admin::deposit_cap`].
     ///

@@ -48,4 +48,8 @@ pub enum Error {
     Overflow = 13,
     /// The admin-configured per-account deposit cap would be exceeded.
     DepositCapExceeded = 14,
+
+    // --- lifecycle (admin) ---
+    /// The contract is paused; mutating entrypoints are rejected.
+    Paused = 15,
 }

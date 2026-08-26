@@ -2,6 +2,7 @@
 
 use soroban_sdk::{token, Address, Env, Map, String, Vec};
 
+use crate::admin::require_not_paused;
 use crate::error::Error;
 use crate::events::{TOPIC_GROUP_CLOSED, TOPIC_GROUP_CONTRIBUTION, TOPIC_GROUP_CREATED, TOPIC_GROUP_PAYOUT};
 use crate::storage::extend_instance_ttl;
@@ -12,6 +13,7 @@ use crate::types::{DataKey, Group};
 /// Returns the new group id. `open == true` until `close` is called.
 pub fn create(env: &Env, creator: Address, name: String) -> Result<u64, Error> {
     extend_instance_ttl(env);
+    require_not_paused(env)?;
     creator.require_auth();
 
     // Allocate a new group id
@@ -50,6 +52,7 @@ pub fn create(env: &Env, creator: Address, name: String) -> Result<u64, Error> {
 /// Errors `GroupClosed` if the group is not accepting members.
 pub fn join(env: &Env, member: Address, group_id: u64) -> Result<(), Error> {
     extend_instance_ttl(env);
+    require_not_paused(env)?;
     member.require_auth();
 
     // Load the group
@@ -89,6 +92,7 @@ pub fn join(env: &Env, member: Address, group_id: u64) -> Result<(), Error> {
 /// Errors `NotAMember` if the caller has not joined.
 pub fn contribute(env: &Env, member: Address, group_id: u64, amount: i128) -> Result<(), Error> {
     extend_instance_ttl(env);
+    require_not_paused(env)?;
     member.require_auth();
 
     // Validate amount
@@ -138,6 +142,7 @@ pub fn contribute(env: &Env, member: Address, group_id: u64, amount: i128) -> Re
 /// be settled. Creator-only.
 pub fn close(env: &Env, creator: Address, group_id: u64) -> Result<(), Error> {
     extend_instance_ttl(env);
+    require_not_paused(env)?;
     creator.require_auth();
 
     // Load the group
@@ -177,6 +182,7 @@ pub fn close(env: &Env, creator: Address, group_id: u64) -> Result<(), Error> {
 /// rather than an unauthenticated relay.
 pub fn payout_equal(env: &Env, caller: Address, group_id: u64) -> Result<(), Error> {
     extend_instance_ttl(env);
+    require_not_paused(env)?;
     caller.require_auth();
 
     // Load the group

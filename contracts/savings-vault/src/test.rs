@@ -732,8 +732,7 @@ fn goal_claim_by_non_owner_rejected() {
     mint(&env, &token, &token_admin, &owner, TARGET);
 
     let goal_id = client
-        .goal_create(&owner, &soroban_sdk::String::from_str(&env, "holiday"), &TARGET)
-        ;
+        .goal_create(&owner, &soroban_sdk::String::from_str(&env, "holiday"), &TARGET);
 
     // Owner contributes the full target so the goal is reached.
     client.goal_contribute(&owner, &goal_id, &TARGET);
@@ -766,8 +765,7 @@ fn group_close_by_non_creator_rejected() {
     let non_creator = Address::generate(&env);
 
     let group_id = client
-        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-a"))
-        ;
+        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-a"));
 
     // Non-creator attempts to close the group.
     let result = client.try_group_close(&non_creator, &group_id);
@@ -798,8 +796,7 @@ fn group_set_shares_by_non_creator_rejected() {
     let non_creator = Address::generate(&env);
 
     let group_id = client
-        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-b"))
-        ;
+        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-b"));
 
     // Add a second member so a valid 10 000-bps split can be constructed.
     client.group_join(&member, &group_id);
@@ -838,8 +835,7 @@ fn group_contribute_by_non_member_rejected() {
     mint(&env, &token, &token_admin, &outsider, AMOUNT);
 
     let group_id = client
-        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-c"))
-        ;
+        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-c"));
 
     // Outsider has never called group_join; must be rejected.
     let result = client.try_group_contribute(&outsider, &group_id, &AMOUNT);
@@ -880,6 +876,7 @@ fn initialize_twice_rejected() {
     );
 }
 
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Issue #31 — Auth review: require_auth on all mutations
 //
@@ -1477,3 +1474,130 @@ fn withdraw_emits_typed_event_with_expected_topic_and_data() {
     assert_eq!(decoded_data, (user, WITHDRAW_AMOUNT, remaining_balance, now));
 }
 
+// ---------------------------------------------------------------------------
+// Issue #47 — Emergency pause (admin)
+//
+// An admin-only `set_paused(bool)` toggles a flag that rejects mutating
+// entrypoints with `Error::Paused` while paused. Reads remain available
+// while paused, and the admin can unpause to resume normal operation.
+// ---------------------------------------------------------------------------
+
+/// While paused, a mutating entrypoint (`group_create`) is rejected with
+/// `Error::Paused`; reads (`admin`, `is_paused`) keep working; and after the
+/// admin unpauses, the same mutating call succeeds.
+#[test]
+fn paused_blocks_writes_and_admin_can_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+
+    client.set_paused(&admin, &true);
+    assert!(client.is_paused(), "vault must report paused after set_paused(true)");
+
+    let result = client.try_group_create(&creator, &soroban_sdk::String::from_str(&env, "pool"));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Paused)),
+        "mutating entrypoints must be rejected with Paused while paused",
+    );
+
+    // Reads remain available while paused.
+    assert_eq!(client.admin(), admin);
+
+    client.set_paused(&admin, &false);
+    assert!(!client.is_paused(), "vault must report unpaused after set_paused(false)");
+
+    let group_id = client.group_create(&creator, &soroban_sdk::String::from_str(&env, "pool"));
+    let group = client.group(&group_id);
+    assert_eq!(group.creator, creator, "group_create must succeed once unpaused");
+}
+
+/// Only the admin may pause/unpause the vault.
+#[test]
+fn set_paused_by_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    let result = client.try_set_paused(&attacker, &true);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Unauthorized)),
+        "non-admin must not be able to pause the vault",
+    );
+    assert!(!client.is_paused(), "vault must remain unpaused after a rejected pause attempt");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #41 — Property test: split rounding sums to pool
+//
+// Weighted settlement must never create or destroy funds via rounding: for
+// any valid share configuration (bps values summing to `TOTAL_BPS`) and any
+// pool balance, the computed per-member payouts must sum to exactly the
+// pool, and every individual payout must be non-negative.
+// ---------------------------------------------------------------------------
+
+mod group_split_properties {
+    use crate::group_split::{compute_payouts, TOTAL_BPS};
+    use proptest::prelude::*;
+    use soroban_sdk::{testutils::Address as _, Address, Env, Map};
+
+    /// Build a valid `shares_bps` map from arbitrary positive `weights`:
+    /// each member's bps is proportional to its weight, and the last
+    /// member absorbs whatever rounding remainder is needed so the shares
+    /// sum to exactly `TOTAL_BPS` (a precondition `set_shares` enforces
+    /// on-chain).
+    fn shares_from_weights(env: &Env, weights: &[u32]) -> (soroban_sdk::Vec<Address>, Map<Address, u32>) {
+        let mut addrs: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(env);
+        for _ in weights {
+            addrs.push_back(Address::generate(env));
+        }
+
+        let total_weight: u64 = weights.iter().map(|w| *w as u64).sum();
+        let mut shares: Map<Address, u32> = Map::new(env);
+        let mut distributed: u32 = 0;
+
+        for (i, w) in weights.iter().enumerate() {
+            let member = addrs.get(i as u32).unwrap();
+            let bps = if i + 1 == weights.len() {
+                TOTAL_BPS - distributed
+            } else {
+                let bps = ((*w as u64) * (TOTAL_BPS as u64) / total_weight) as u32;
+                distributed += bps;
+                bps
+            };
+            shares.set(member, bps);
+        }
+
+        (addrs, shares)
+    }
+
+    proptest! {
+        /// For any valid shares configuration and any non-negative pool
+        /// balance, settlement conserves the pool exactly: the sum of
+        /// computed payouts equals the pool, and no payout is negative.
+        #[test]
+        fn split_rounding_sums_to_pool(
+            weights in proptest::collection::vec(1u32..=1_000u32, 1..=8),
+            pool in 0i128..=1_000_000_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let (addrs, shares) = shares_from_weights(&env, &weights);
+            let remainder_recipient = addrs.get(0).unwrap();
+
+            let payouts = compute_payouts(&env, &shares, pool, &remainder_recipient);
+
+            let mut sum: i128 = 0;
+            for (_member, amount) in payouts.iter() {
+                prop_assert!(amount >= 0, "every payout must be non-negative, got {}", amount);
+                sum += amount;
+            }
+
+            prop_assert_eq!(sum, pool, "sum of payouts must equal the pool exactly");
+        }
+    }
+}

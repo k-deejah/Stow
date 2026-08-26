@@ -4,12 +4,42 @@
 
 use soroban_sdk::{token, Address, Env, Map, Vec};
 
+use crate::admin::require_not_paused;
 use crate::error::Error;
 use crate::events::{TOPIC_GROUP_SHARES_SET, TOPIC_GROUP_SPLIT_SETTLED};
 use crate::storage::extend_instance_ttl;
 use crate::types::{DataKey, Group};
 
 pub const TOTAL_BPS: u32 = 10_000;
+
+/// Compute each member's payout for a `pool` split by `shares_bps`.
+///
+/// Each member's raw share is `pool * bps / TOTAL_BPS` (floor division). The
+/// leftover from rounding down (always `>= 0`) is assigned entirely to
+/// `remainder_recipient` so the sum of payouts always equals `pool` exactly.
+pub fn compute_payouts(
+    env: &Env,
+    shares_bps: &Map<Address, u32>,
+    pool: i128,
+    remainder_recipient: &Address,
+) -> Map<Address, i128> {
+    let mut payouts: Map<Address, i128> = Map::new(env);
+    let mut distributed: i128 = 0;
+
+    for (member, bps) in shares_bps.iter() {
+        let amount = pool * (bps as i128) / (TOTAL_BPS as i128);
+        distributed += amount;
+        payouts.set(member, amount);
+    }
+
+    let remainder = pool - distributed;
+    if remainder != 0 {
+        let current = payouts.get(remainder_recipient.clone()).unwrap_or(0);
+        payouts.set(remainder_recipient.clone(), current + remainder);
+    }
+
+    payouts
+}
 
 /// Set the per-member split for a group. Creator-only, group must be closed.
 ///
@@ -25,6 +55,7 @@ pub fn set_shares(
     shares_bps: Map<Address, u32>,
 ) -> Result<(), Error> {
     extend_instance_ttl(env);
+    require_not_paused(env)?;
     creator.require_auth();
 
     let key = DataKey::Group(group_id);
@@ -70,6 +101,7 @@ pub fn set_shares(
 ///   any per-member computation would not fit in `i128`.
 pub fn settle(env: &Env, caller: Address, group_id: u64) -> Result<(), Error> {
     extend_instance_ttl(env);
+    require_not_paused(env)?;
     caller.require_auth();
 
     let key = DataKey::Group(group_id);
