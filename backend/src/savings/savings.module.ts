@@ -15,8 +15,8 @@ import { WebhooksModule } from '../webhooks/webhooks.module';
     TypeOrmModule.forFeature([AnchorDeposit, Balance]),
     CacheModule.register({ ttl: 10_000 }),
   ],
-  controllers: [AnchorController, BalanceController],
-  providers: [AnchorService, BalanceService],
-  exports: [AnchorService, BalanceService],
+  controllers: [SavingsController, AnchorController, BalanceController],
+  providers: [SavingsService, AnchorService, BalanceService],
+  exports: [SavingsService, AnchorService, BalanceService],
 })
 export class SavingsModule {}
