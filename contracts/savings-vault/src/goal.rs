@@ -122,3 +122,12 @@ pub fn get_goal(env: &Env, goal_id: u64) -> Result<Goal, Error> {
         .get(&DataKey::Goal(goal_id))
         .ok_or(Error::NotFound)
 }
+
+/// Helper to allocate the next goal id.
+fn next_goal_id(env: &Env) -> u64 {
+    let key = DataKey::NextGoalId;
+    let current: u64 = env.storage().instance().get(&key).unwrap_or(0);
+    let next = current + 1;
+    env.storage().instance().set(&key, &next);
+    next
+}

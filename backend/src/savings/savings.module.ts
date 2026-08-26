@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { CacheModule } from '@nestjs/cache-manager';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { GoalsModule } from '../goals/goals.module';
 import { AnchorController } from './anchor.controller';
 import { AnchorCallbackController } from './anchor-callback.controller';
 import { AnchorService } from './anchor.service';
