@@ -4,17 +4,19 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { SorobanService, SorobanRpcEvent } from './soroban.service';
 import { SystemState } from './entities/system-state.entity';
+import { SavingsProjectionService } from '../savings-projection/savings-projection.service';
 
 const LAST_LEDGER_KEY = 'soroban:last_processed_ledger';
 
 /**
- * Polls the Stow savings-vault contract for events and dispatches them.
+ * Polls the Stow savings-vault contract for events and dispatches them to
+ * the savings projections via the shared `SavingsProjectionService`.
  *
- * Skeleton after the pivot: the generic poll loop and ledger checkpointing are
- * kept and working. Per-event decoding (deposit, withdraw, locked_created,
- * goal_reached, group_settled, ...) is stubbed.
- *
- * TODO(issue): implement `processEvent` for each savings-vault event topic.
+ * Ledger checkpointing gates re-delivery across polls: a ledger only
+ * advances the checkpoint once every event up to it has been applied, and
+ * each projection handler is itself idempotent (upsert-by-on-chain-id, or a
+ * status flag guarding the state change), so a retried poll over a
+ * partially-applied ledger range is safe.
  */
 @Injectable()
 export class SorobanListener {
@@ -23,6 +25,7 @@ export class SorobanListener {
 
   constructor(
     private readonly sorobanService: SorobanService,
+    private readonly savingsProjectionService: SavingsProjectionService,
     @InjectRepository(SystemState)
     private readonly systemStateRepository: Repository<SystemState>,
   ) {}
@@ -70,14 +73,12 @@ export class SorobanListener {
     }
   }
 
-  /**
-   * Decode and apply a single savings-vault event.
-   * TODO(issue): switch on `event.topic[0]` and update savings state.
-   */
+  /** Decode and apply a single savings-vault event. */
   private async processEvent(event: SorobanRpcEvent): Promise<void> {
+    const topic = event.topic[0];
     this.logger.debug(`event ${event.id} topic=${event.topic.join('.')}`);
-    // no-op skeleton
-    return Promise.resolve();
+    if (!topic) return;
+    await this.savingsProjectionService.apply(topic, event.value ?? {});
   }
 
   private async getLastProcessedLedger(): Promise<number> {
