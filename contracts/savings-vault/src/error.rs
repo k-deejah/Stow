@@ -42,4 +42,8 @@ pub enum Error {
     InvalidShares = 11,
     /// Caller is not a member of this group.
     NotAMember = 12,
+
+    // --- lifecycle (admin) ---
+    /// The contract is paused; mutating entrypoints are rejected.
+    Paused = 13,
 }

@@ -38,7 +38,7 @@ fn setup_with_token(env: &Env) -> (SavingsVaultClient, Address, Address) {
     let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_address = token_id.address();
 
-    client.initialize(&admin, &token_address).unwrap();
+    client.initialize(&admin, &token_address);
 
     (client, admin, token_address)
 }
@@ -103,7 +103,7 @@ fn flexible_withdraw_over_balance_rejected() {
     mint(&env, &token, &token_admin, &user, DEPOSIT);
 
     // Deposit the full amount.
-    client.deposit(&user, &DEPOSIT).unwrap();
+    client.deposit(&user, &DEPOSIT);
 
     // Attempting to withdraw one stroop more than the balance must fail.
     let result = client.try_withdraw(&user, &OVER_AMOUNT);
@@ -116,7 +116,7 @@ fn flexible_withdraw_over_balance_rejected() {
     );
 
     // Balance must remain intact after the failed withdrawal.
-    let account = client.get_account(&user).unwrap();
+    let account = client.get_account(&user);
     assert_eq!(
         account.balance, DEPOSIT,
         "balance must not change after a rejected over-withdrawal",
@@ -140,13 +140,13 @@ fn flexible_withdraw_exact_balance_succeeds() {
     const DEPOSIT: i128 = 50_000_000; // 50 USDC
 
     mint(&env, &token, &token_admin, &user, DEPOSIT);
-    client.deposit(&user, &DEPOSIT).unwrap();
+    client.deposit(&user, &DEPOSIT);
 
     // Withdraw the exact amount — must not error.
-    client.withdraw(&user, &DEPOSIT).unwrap();
+    client.withdraw(&user, &DEPOSIT);
 
     // Balance must now be zero.
-    let account = client.get_account(&user).unwrap();
+    let account = client.get_account(&user);
     assert_eq!(
         account.balance, 0,
         "balance must be zero after a full withdrawal",
@@ -185,7 +185,7 @@ fn locked_withdraw_over_balance_rejected() {
 
     let unlock_at = now + 1_000; // one second from now
 
-    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &unlock_at).unwrap();
+    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &unlock_at);
 
     // Advance time past the lock.
     env.ledger().set(LedgerInfo {
@@ -210,7 +210,7 @@ fn locked_withdraw_over_balance_rejected() {
     );
 
     // Plan balance must be untouched.
-    let plan = client.locked_plan(&plan_id).unwrap();
+    let plan = client.locked_plan(&plan_id);
     assert_eq!(
         plan.balance, LOCKED_AMOUNT,
         "locked plan balance must not change after a rejected over-withdrawal",
@@ -246,7 +246,7 @@ fn locked_withdraw_exact_balance_after_unlock_succeeds() {
     });
 
     let unlock_at = now + 500;
-    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &unlock_at).unwrap();
+    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &unlock_at);
 
     // Advance past the lock.
     env.ledger().set(LedgerInfo {
@@ -261,9 +261,9 @@ fn locked_withdraw_exact_balance_after_unlock_succeeds() {
     });
 
     // Withdraw the exact amount — must not error.
-    client.locked_withdraw(&owner, &plan_id, &LOCKED_AMOUNT).unwrap();
+    client.locked_withdraw(&owner, &plan_id, &LOCKED_AMOUNT);
 
-    let plan = client.locked_plan(&plan_id).unwrap();
+    let plan = client.locked_plan(&plan_id);
     assert_eq!(
         plan.balance, 0,
         "locked plan balance must be zero after a full withdrawal",
@@ -303,7 +303,7 @@ fn locked_withdraw_still_locked_and_over_balance_prefers_insufficient_balance() 
     });
 
     let unlock_at = now + 10_000; // still in the future
-    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &unlock_at).unwrap();
+    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &unlock_at);
 
     // Attempt to withdraw more than the balance while the lock is still active.
     let result = client.try_locked_withdraw(&owner, &plan_id, &(LOCKED_AMOUNT + 1));
@@ -317,7 +317,7 @@ fn locked_withdraw_still_locked_and_over_balance_prefers_insufficient_balance() 
     );
 
     // Either way, funds must not move.
-    let plan = client.locked_plan(&plan_id).unwrap();
+    let plan = client.locked_plan(&plan_id);
     assert_eq!(plan.balance, LOCKED_AMOUNT);
 }
 
@@ -395,7 +395,7 @@ fn flexible_withdraw_by_non_owner_rejected() {
     const DEPOSIT: i128 = 100_000_000; // 100 USDC
 
     mint(&env, &token, &token_admin, &owner, DEPOSIT);
-    client.deposit(&owner, &DEPOSIT).unwrap();
+    client.deposit(&owner, &DEPOSIT);
 
     // Switch: only attacker's auth is approved from here on.
     // The contract must compare attacker != owner and return Unauthorized.
@@ -410,7 +410,7 @@ fn flexible_withdraw_by_non_owner_rejected() {
 
     // Owner's balance must be untouched.
     env.mock_all_auths();
-    let account = client.get_account(&owner).unwrap();
+    let account = client.get_account(&owner);
     assert_eq!(account.balance, DEPOSIT);
 }
 
@@ -446,7 +446,7 @@ fn locked_top_up_by_non_owner_rejected() {
         max_entry_ttl: 3_110_400,
     });
 
-    let plan_id = client.locked_create(&owner, &AMOUNT, &(now + 1_000)).unwrap();
+    let plan_id = client.locked_create(&owner, &AMOUNT, &(now + 1_000));
 
     // Attacker attempts to top-up the owner's plan.
     let result = client.try_locked_top_up(&attacker, &plan_id, &AMOUNT);
@@ -458,7 +458,7 @@ fn locked_top_up_by_non_owner_rejected() {
     );
 
     // Plan balance must not change.
-    let plan = client.locked_plan(&plan_id).unwrap();
+    let plan = client.locked_plan(&plan_id);
     assert_eq!(plan.balance, AMOUNT);
 }
 
@@ -493,7 +493,7 @@ fn locked_withdraw_by_non_owner_rejected() {
     });
 
     let unlock_at = now + 500;
-    let plan_id = client.locked_create(&owner, &AMOUNT, &unlock_at).unwrap();
+    let plan_id = client.locked_create(&owner, &AMOUNT, &unlock_at);
 
     // Advance past the lock so `StillLocked` is not a confound.
     env.ledger().set(LedgerInfo {
@@ -516,7 +516,7 @@ fn locked_withdraw_by_non_owner_rejected() {
         "attacker must not withdraw from another user's locked plan after unlock",
     );
 
-    let plan = client.locked_plan(&plan_id).unwrap();
+    let plan = client.locked_plan(&plan_id);
     assert_eq!(plan.balance, AMOUNT);
 }
 
@@ -539,11 +539,10 @@ fn goal_claim_by_non_owner_rejected() {
     mint(&env, &token, &token_admin, &owner, TARGET);
 
     let goal_id = client
-        .goal_create(&owner, &soroban_sdk::String::from_str(&env, "holiday"), &TARGET)
-        .unwrap();
+        .goal_create(&owner, &soroban_sdk::String::from_str(&env, "holiday"), &TARGET);
 
     // Owner contributes the full target so the goal is reached.
-    client.goal_contribute(&owner, &goal_id, &TARGET).unwrap();
+    client.goal_contribute(&owner, &goal_id, &TARGET);
 
     // Attacker tries to claim a goal they don't own.
     let result = client.try_goal_claim(&attacker, &goal_id);
@@ -555,7 +554,7 @@ fn goal_claim_by_non_owner_rejected() {
     );
 
     // Goal's saved amount must be intact.
-    let goal = client.goal(&goal_id).unwrap();
+    let goal = client.goal(&goal_id);
     assert_eq!(goal.saved_amount, TARGET);
 }
 
@@ -573,8 +572,7 @@ fn group_close_by_non_creator_rejected() {
     let non_creator = Address::generate(&env);
 
     let group_id = client
-        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-a"))
-        .unwrap();
+        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-a"));
 
     // Non-creator attempts to close the group.
     let result = client.try_group_close(&non_creator, &group_id);
@@ -586,7 +584,7 @@ fn group_close_by_non_creator_rejected() {
     );
 
     // Group must still be open.
-    let group = client.group(&group_id).unwrap();
+    let group = client.group(&group_id);
     assert!(group.open, "group must remain open after rejected close attempt");
 }
 
@@ -605,12 +603,11 @@ fn group_set_shares_by_non_creator_rejected() {
     let non_creator = Address::generate(&env);
 
     let group_id = client
-        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-b"))
-        .unwrap();
+        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-b"));
 
     // Add a second member so a valid 10 000-bps split can be constructed.
-    client.group_join(&member, &group_id).unwrap();
-    client.group_close(&creator, &group_id).unwrap();
+    client.group_join(&member, &group_id);
+    client.group_close(&creator, &group_id);
 
     // Build a valid shares map that sums to 10_000 bps.
     let mut shares = soroban_sdk::Map::new(&env);
@@ -645,8 +642,7 @@ fn group_contribute_by_non_member_rejected() {
     mint(&env, &token, &token_admin, &outsider, AMOUNT);
 
     let group_id = client
-        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-c"))
-        .unwrap();
+        .group_create(&creator, &soroban_sdk::String::from_str(&env, "pool-c"));
 
     // Outsider has never called group_join; must be rejected.
     let result = client.try_group_contribute(&outsider, &group_id, &AMOUNT);
@@ -658,7 +654,7 @@ fn group_contribute_by_non_member_rejected() {
     );
 
     // Pool balance must remain zero.
-    let group = client.group(&group_id).unwrap();
+    let group = client.group(&group_id);
     assert_eq!(group.balance, 0);
 }
 
@@ -685,4 +681,132 @@ fn initialize_twice_rejected() {
         Err(Ok(Error::AlreadyInitialized)),
         "initialize must be callable exactly once",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #47 — Emergency pause (admin)
+//
+// An admin-only `set_paused(bool)` toggles a flag that rejects mutating
+// entrypoints with `Error::Paused` while paused. Reads remain available
+// while paused, and the admin can unpause to resume normal operation.
+// ---------------------------------------------------------------------------
+
+/// While paused, a mutating entrypoint (`group_create`) is rejected with
+/// `Error::Paused`; reads (`admin`, `is_paused`) keep working; and after the
+/// admin unpauses, the same mutating call succeeds.
+#[test]
+fn paused_blocks_writes_and_admin_can_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+
+    client.set_paused(&admin, &true);
+    assert!(client.is_paused(), "vault must report paused after set_paused(true)");
+
+    let result = client.try_group_create(&creator, &soroban_sdk::String::from_str(&env, "pool"));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Paused)),
+        "mutating entrypoints must be rejected with Paused while paused",
+    );
+
+    // Reads remain available while paused.
+    assert_eq!(client.admin(), admin);
+
+    client.set_paused(&admin, &false);
+    assert!(!client.is_paused(), "vault must report unpaused after set_paused(false)");
+
+    let group_id = client.group_create(&creator, &soroban_sdk::String::from_str(&env, "pool"));
+    let group = client.group(&group_id);
+    assert_eq!(group.creator, creator, "group_create must succeed once unpaused");
+}
+
+/// Only the admin may pause/unpause the vault.
+#[test]
+fn set_paused_by_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    let result = client.try_set_paused(&attacker, &true);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Unauthorized)),
+        "non-admin must not be able to pause the vault",
+    );
+    assert!(!client.is_paused(), "vault must remain unpaused after a rejected pause attempt");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #41 — Property test: split rounding sums to pool
+//
+// Weighted settlement must never create or destroy funds via rounding: for
+// any valid share configuration (bps values summing to `TOTAL_BPS`) and any
+// pool balance, the computed per-member payouts must sum to exactly the
+// pool, and every individual payout must be non-negative.
+// ---------------------------------------------------------------------------
+
+mod group_split_properties {
+    use crate::group_split::{compute_payouts, TOTAL_BPS};
+    use proptest::prelude::*;
+    use soroban_sdk::{testutils::Address as _, Address, Env, Map};
+
+    /// Build a valid `shares_bps` map from arbitrary positive `weights`:
+    /// each member's bps is proportional to its weight, and the last
+    /// member absorbs whatever rounding remainder is needed so the shares
+    /// sum to exactly `TOTAL_BPS` (a precondition `set_shares` enforces
+    /// on-chain).
+    fn shares_from_weights(env: &Env, weights: &[u32]) -> (soroban_sdk::Vec<Address>, Map<Address, u32>) {
+        let mut addrs: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(env);
+        for _ in weights {
+            addrs.push_back(Address::generate(env));
+        }
+
+        let total_weight: u64 = weights.iter().map(|w| *w as u64).sum();
+        let mut shares: Map<Address, u32> = Map::new(env);
+        let mut distributed: u32 = 0;
+
+        for (i, w) in weights.iter().enumerate() {
+            let member = addrs.get(i as u32).unwrap();
+            let bps = if i + 1 == weights.len() {
+                TOTAL_BPS - distributed
+            } else {
+                let bps = ((*w as u64) * (TOTAL_BPS as u64) / total_weight) as u32;
+                distributed += bps;
+                bps
+            };
+            shares.set(member, bps);
+        }
+
+        (addrs, shares)
+    }
+
+    proptest! {
+        /// For any valid shares configuration and any non-negative pool
+        /// balance, settlement conserves the pool exactly: the sum of
+        /// computed payouts equals the pool, and no payout is negative.
+        #[test]
+        fn split_rounding_sums_to_pool(
+            weights in proptest::collection::vec(1u32..=1_000u32, 1..=8),
+            pool in 0i128..=1_000_000_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let (addrs, shares) = shares_from_weights(&env, &weights);
+            let remainder_recipient = addrs.get(0).unwrap();
+
+            let payouts = compute_payouts(&env, &shares, pool, &remainder_recipient);
+
+            let mut sum: i128 = 0;
+            for (_member, amount) in payouts.iter() {
+                prop_assert!(amount >= 0, "every payout must be non-negative, got {}", amount);
+                sum += amount;
+            }
+
+            prop_assert_eq!(sum, pool, "sum of payouts must equal the pool exactly");
+        }
+    }
 }

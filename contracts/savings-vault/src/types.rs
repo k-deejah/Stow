@@ -64,6 +64,8 @@ pub enum DataKey {
     Token,
     /// Contract admin.
     Admin,
+    /// Emergency-pause flag. Absent/false means unpaused.
+    Paused,
     /// Monotonic counters for plan/goal/group ids.
     NextLockedId,
     NextGoalId,

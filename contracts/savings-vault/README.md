@@ -13,6 +13,8 @@ frontend) can build against it without reading the stub bodies.
 - [Module → issue map](#module--issue-map)
 - [Layout](#layout)
 - [Build & test](#build--test)
+- [Wasm size budget & optimization](#wasm-size-budget--optimization)
+- [Testnet deployment](#testnet-deployment)
 - [Entrypoint reference](#entrypoint-reference)
 - [Event schema](#event-schema)
 
@@ -58,6 +60,52 @@ cargo test           # placeholder tests are #[ignore]d until implemented
 > runtime until a contributor implements them. The signatures, auth rules,
 > errors, and events below are the contract this crate implements against;
 > implementations must not deviate from them without updating this doc.
+
+## Wasm size budget & optimization
+
+CI builds the release wasm, runs `stellar contract optimize` against it, and
+fails the build if the **optimized** wasm exceeds a size budget. This catches
+size regressions before they reach a deployed contract.
+
+The current budget is `65536` bytes (64 KiB), set via `WASM_SIZE_BUDGET_BYTES`
+in the `savings-vault` job's `env:` block in
+[`.github/workflows/contract-ci.yml`](../../.github/workflows/contract-ci.yml).
+Raise it only alongside a deliberate decision to accept the size increase —
+e.g. a new savings mechanism or a larger dependency — not as a routine fix
+for a failing build.
+
+To check locally:
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+stellar contract optimize \
+  --wasm target/wasm32-unknown-unknown/release/savings_vault.wasm \
+  --wasm-out target/wasm32-unknown-unknown/release/savings_vault.optimized.wasm
+wc -c target/wasm32-unknown-unknown/release/savings_vault.optimized.wasm
+```
+
+## Testnet deployment
+
+[`scripts/deploy_testnet.sh`](scripts/deploy_testnet.sh) builds, deploys, and
+initializes the vault on Stellar testnet in one command, then prints the
+deployed contract id:
+
+```bash
+SOURCE_ACCOUNT=alice ./scripts/deploy_testnet.sh
+```
+
+`SOURCE_ACCOUNT` must name a funded Stellar CLI identity (create one with
+`stellar keys generate --fund --network testnet alice`). By default the
+script wraps native XLM as the vault's token, since it's always available on
+testnet with no setup. Env vars:
+
+| Var | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `SOURCE_ACCOUNT` | yes | — | Identity that deploys, pays fees, and becomes admin unless overridden. |
+| `ADMIN_ACCOUNT` | no | `SOURCE_ACCOUNT`'s address | Address set as the vault admin. |
+| `TOKEN_CONTRACT_ID` | no | — | Use an already-deployed SEP-41 token instead of wrapping an asset. |
+| `TEST_ASSET` | no | `native` | Classic asset to wrap as the vault's token, as `CODE:ISSUER`. |
+| `STELLAR_NETWORK` | no | `testnet` | Network passed to the Stellar CLI. |
 
 ---
 
