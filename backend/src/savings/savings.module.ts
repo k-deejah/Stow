@@ -8,6 +8,7 @@ import { AnchorService } from './anchor.service';
 import { AnchorDeposit } from './entities/anchor-deposit.entity';
 import { Balance } from './entities/balance.entity';
 import { Group } from './entities/group.entity';
+import { GroupMember } from './entities/group-member.entity';
 import { BalanceService } from './balance.service';
 import { GroupsService } from './groups.service';
 import { BalanceController } from './balance.controller';
@@ -15,7 +16,7 @@ import { WebhooksModule } from '../webhooks/webhooks.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([AnchorDeposit, Balance, Group]),
+    TypeOrmModule.forFeature([AnchorDeposit, Balance, Group, GroupMember]),
     CacheModule.register({ ttl: 10_000 }),
   ],
   controllers: [AnchorController, BalanceController],
