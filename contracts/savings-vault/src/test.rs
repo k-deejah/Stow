@@ -686,3 +686,268 @@ fn initialize_twice_rejected() {
         "initialize must be callable exactly once",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #15 — Implement `goal::create`
+// ---------------------------------------------------------------------------
+
+/// Creating a goal with a positive target must succeed, store the goal with
+/// zero progress, and return a new id.
+#[test]
+fn goal_create_stores_goal_with_zero_progress() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "New laptop");
+
+    const TARGET: i128 = 5_000_000_000; // 500 USDC
+
+    let goal_id = client.goal_create(&owner, &name, &TARGET).unwrap();
+
+    // Read the goal back through raw contract storage: `goal::get_goal` is a
+    // separate stub (issue-scoped independently) and is not required to be
+    // implemented for `goal::create` to be verified.
+    let goal: crate::types::Goal = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&crate::types::DataKey::Goal(goal_id))
+            .unwrap()
+    });
+
+    assert_eq!(goal.id, goal_id);
+    assert_eq!(goal.owner, owner);
+    assert_eq!(goal.name, name);
+    assert_eq!(goal.target_amount, TARGET);
+    assert_eq!(
+        goal.saved_amount, 0,
+        "a newly created goal must start with zero saved progress",
+    );
+    assert!(
+        goal.reached_at.is_none(),
+        "a newly created goal must not be reached",
+    );
+}
+
+/// Each call to `goal_create` must allocate a distinct, increasing id.
+#[test]
+fn goal_create_allocates_sequential_ids() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "goal");
+
+    let first_id = client.goal_create(&owner, &name, &1_000_000).unwrap();
+    let second_id = client.goal_create(&owner, &name, &2_000_000).unwrap();
+
+    assert_ne!(
+        first_id, second_id,
+        "sequential goal_create calls must not reuse ids",
+    );
+}
+
+/// A zero target must be rejected with `InvalidAmount` and must not persist
+/// a goal or allocate an id.
+#[test]
+fn goal_create_zero_target_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "zero target");
+
+    let result = client.try_goal_create(&owner, &name, &0);
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::InvalidAmount)),
+        "a zero target_amount must be rejected",
+    );
+}
+
+/// A negative target must be rejected with `InvalidAmount`.
+#[test]
+fn goal_create_negative_target_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "negative target");
+
+    let result = client.try_goal_create(&owner, &name, &-1);
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::InvalidAmount)),
+        "a negative target_amount must be rejected",
+    );
+}
+
+/// The smallest valid target (1 stroop) must be accepted — boundary
+/// condition paired with the zero-rejection test above.
+#[test]
+fn goal_create_minimum_positive_target_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "tiny goal");
+
+    let goal_id = client.goal_create(&owner, &name, &1).unwrap();
+
+    let goal: crate::types::Goal = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&crate::types::DataKey::Goal(goal_id))
+            .unwrap()
+    });
+    assert_eq!(goal.target_amount, 1);
+}
+
+/// `goal_create` must require the owner's authorization — calling without
+/// any mocked auth for `owner` must be rejected by the host's auth check
+/// (see the "Auth model recap" note above `initialize_twice_rejected`'s
+/// section: a missing `require_auth()` match surfaces as `Err(Err(_))`).
+#[test]
+fn goal_create_requires_owner_auth() {
+    let env = Env::default();
+    // Intentionally no `mock_all_auths()` / `mock_auths()`: no address has
+    // been authorized, so `owner.require_auth()` must reject the call.
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "unauthorized");
+
+    let result = client.try_goal_create(&owner, &name, &1_000_000);
+
+    assert!(
+        result.is_err(),
+        "goal_create must fail when owner.require_auth() has no matching authorization, got {:?}",
+        result,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #14 — Implement `locked::get_plan`
+//
+// `locked::create` (issue #11) is a separate, still-unimplemented stub, so
+// these tests inject a `LockedPlan` fixture directly into persistent storage
+// (mirroring the `env.as_contract(...)` pattern used by the goal::create
+// tests above) instead of calling `client.locked_create`. This keeps
+// `get_plan` coverage independent of issue #11's implementation status.
+// ---------------------------------------------------------------------------
+
+/// Write a `LockedPlan` fixture directly into the contract's persistent
+/// storage, bypassing the still-unimplemented `locked::create` (issue #11).
+fn seed_locked_plan(env: &Env, contract_id: &Address, plan: &crate::types::LockedPlan) {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&crate::types::DataKey::Locked(plan.id), plan);
+    });
+}
+
+/// Reading a plan that was seeded in storage must return accurate state.
+#[test]
+fn locked_plan_returns_plan_after_create() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+
+    const AMOUNT: i128 = 300_000_000; // 300 USDC
+    const PLAN_ID: u64 = 1;
+
+    let now: u64 = 5_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let unlock_at = now + 10_000;
+    let expected = crate::types::LockedPlan {
+        id: PLAN_ID,
+        owner: owner.clone(),
+        balance: AMOUNT,
+        unlock_at,
+        created_at: now,
+    };
+    seed_locked_plan(&env, &client.address, &expected);
+
+    let plan = client.locked_plan(&PLAN_ID).unwrap();
+
+    assert_eq!(plan.id, PLAN_ID);
+    assert_eq!(plan.owner, owner);
+    assert_eq!(plan.balance, AMOUNT);
+    assert_eq!(plan.unlock_at, unlock_at);
+    assert_eq!(plan.created_at, now);
+}
+
+/// Reading an id that was never created must return `NotFound`, not panic.
+#[test]
+fn locked_plan_unknown_id_returns_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+
+    let result = client.try_locked_plan(&999);
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::NotFound)),
+        "reading a non-existent locked plan id must return NotFound",
+    );
+}
+
+/// `locked_plan` is a read-only query: it must not require any
+/// authorization and must succeed even when no auths are mocked.
+#[test]
+fn locked_plan_requires_no_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+
+    const AMOUNT: i128 = 10_000_000; // 10 USDC
+    const PLAN_ID: u64 = 1;
+
+    let now: u64 = 1_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let plan = crate::types::LockedPlan {
+        id: PLAN_ID,
+        owner: owner.clone(),
+        balance: AMOUNT,
+        unlock_at: now + 500,
+        created_at: now,
+    };
+    seed_locked_plan(&env, &client.address, &plan);
+
+    // Clear all mocked auths, then confirm the read-only query still works.
+    env.set_auths(&[]);
+    let plan = client.locked_plan(&PLAN_ID).unwrap();
+    assert_eq!(plan.balance, AMOUNT);
+}
