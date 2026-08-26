@@ -11,10 +11,11 @@
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger, LedgerInfo},
     token::StellarAssetClient,
-    Address, Env, Map, String,
+    Address, Env, IntoVal, Map, String,
 };
 
 use crate::error::Error;
+use crate::events::{TOPIC_DEPOSIT, TOPIC_WITHDRAW};
 use crate::group_split;
 use crate::{SavingsVault, SavingsVaultClient};
 
@@ -1286,5 +1287,193 @@ fn set_deposit_cap_rejects_negative() {
 
     let result = client.try_set_deposit_cap(&-1i128);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+// ---------------------------------------------------------------------------
+// goal::get_goal
+// ---------------------------------------------------------------------------
+
+/// `goal()` returns the goal as created, and errors `NotFound` for an id
+/// that was never created.
+#[test]
+fn get_goal_returns_created_goal_and_not_found_for_unknown_id() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TARGET: i128 = 100_000_000;
+    const CONTRIBUTION: i128 = 40_000_000;
+
+    mint(&env, &token, &token_admin, &owner, CONTRIBUTION);
+
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "holiday"), &TARGET);
+    client.goal_contribute(&owner, &goal_id, &CONTRIBUTION);
+
+    let goal = client.goal(&goal_id);
+    assert_eq!(goal.id, goal_id);
+    assert_eq!(goal.owner, owner);
+    assert_eq!(goal.target_amount, TARGET);
+    assert_eq!(goal.saved_amount, CONTRIBUTION);
+    assert!(goal.reached_at.is_none());
+
+    let result = client.try_goal(&(goal_id + 1));
+    assert!(
+        matches!(result, Err(Ok(Error::NotFound))),
+        "expected Err(Ok(Error::NotFound)) for an unknown goal id"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// group_split::set_shares
+// ---------------------------------------------------------------------------
+
+/// Shares whose bps values don't sum to `TOTAL_BPS` are rejected, and the
+/// group's stored shares are left untouched.
+#[test]
+fn group_set_shares_rejects_invalid_sum() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+    let member_b = Address::generate(&env);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "split-pool"));
+    client.group_join(&member_b, &group_id);
+    client.group_close(&creator, &group_id);
+
+    let mut shares = Map::new(&env);
+    shares.set(creator.clone(), 5_000u32);
+    shares.set(member_b.clone(), 4_000u32); // 5_000 + 4_000 = 9_000 != TOTAL_BPS
+
+    let result = client.try_group_set_shares(&creator, &group_id, &shares);
+    assert_eq!(result, Err(Ok(Error::InvalidShares)));
+}
+
+/// A shares map naming an address that never joined the group is rejected,
+/// even if the bps values would otherwise sum correctly.
+#[test]
+fn group_set_shares_rejects_non_member_key() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+    let member_b = Address::generate(&env);
+    let outsider = Address::generate(&env);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "split-pool"));
+    client.group_join(&member_b, &group_id);
+    client.group_close(&creator, &group_id);
+
+    let mut shares = Map::new(&env);
+    shares.set(creator.clone(), 5_000u32);
+    shares.set(outsider.clone(), 5_000u32); // outsider never joined
+
+    let result = client.try_group_set_shares(&creator, &group_id, &shares);
+    assert_eq!(result, Err(Ok(Error::InvalidShares)));
+}
+
+/// Valid shares that sum to exactly `TOTAL_BPS` and name only group members
+/// are stored and emit a `group_shares_set` event.
+#[test]
+fn group_set_shares_stores_valid_shares() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+    let member_b = Address::generate(&env);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "split-pool"));
+    client.group_join(&member_b, &group_id);
+    client.group_close(&creator, &group_id);
+
+    let mut shares = Map::new(&env);
+    shares.set(creator.clone(), 6_000u32);
+    shares.set(member_b.clone(), 4_000u32);
+
+    client.group_set_shares(&creator, &group_id, &shares);
+    let event_count = env.events().all().len();
+    assert_eq!(
+        event_count, 1,
+        "set_shares emits exactly one group_shares_set event"
+    );
+
+    let group = client.group(&group_id);
+    assert_eq!(group.shares_bps.get(creator.clone()), Some(6_000u32));
+    assert_eq!(group.shares_bps.get(member_b.clone()), Some(4_000u32));
+}
+
+// ---------------------------------------------------------------------------
+// flexible::deposit / flexible::withdraw events
+// ---------------------------------------------------------------------------
+
+/// `deposit` emits a `deposit` event with the (from, amount, new_balance,
+/// timestamp) data tuple described in the events registry.
+#[test]
+fn deposit_emits_typed_event_with_expected_topic_and_data() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const AMOUNT: i128 = 25_000_000;
+
+    mint(&env, &token, &token_admin, &user, AMOUNT);
+
+    client.deposit(&user, &AMOUNT);
+
+    let now = env.ledger().timestamp();
+    let events = env.events().all();
+    let (contract_id, topics, data) = events.last().unwrap().clone();
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (TOPIC_DEPOSIT, user.clone()).into_val(&env);
+    let decoded_data: (Address, i128, i128, u64) =
+        soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap();
+
+    assert_eq!(contract_id, client.address);
+    assert_eq!(topics, expected_topics);
+    assert_eq!(decoded_data, (user, AMOUNT, AMOUNT, now));
+}
+
+/// `withdraw` emits a `withdraw` event with the (owner, amount,
+/// new_balance, timestamp) data tuple described in the events registry.
+#[test]
+fn withdraw_emits_typed_event_with_expected_topic_and_data() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const DEPOSIT_AMOUNT: i128 = 25_000_000;
+    const WITHDRAW_AMOUNT: i128 = 10_000_000;
+
+    mint(&env, &token, &token_admin, &user, DEPOSIT_AMOUNT);
+    client.deposit(&user, &DEPOSIT_AMOUNT);
+
+    client.withdraw(&user, &WITHDRAW_AMOUNT);
+
+    let now = env.ledger().timestamp();
+    let events = env.events().all();
+    let (contract_id, topics, data) = events.last().unwrap().clone();
+    let remaining_balance = DEPOSIT_AMOUNT - WITHDRAW_AMOUNT;
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (TOPIC_WITHDRAW, user.clone()).into_val(&env);
+    let decoded_data: (Address, i128, i128, u64) =
+        soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap();
+
+    assert_eq!(contract_id, client.address);
+    assert_eq!(topics, expected_topics);
+    assert_eq!(decoded_data, (user, WITHDRAW_AMOUNT, remaining_balance, now));
 }
 
