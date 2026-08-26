@@ -14,9 +14,9 @@ use soroban_sdk::{
     Address, Env, Map, String,
 };
 
-use crate::{SavingsVault, SavingsVaultClient};
 use crate::error::Error;
 use crate::group_split;
+use crate::{SavingsVault, SavingsVaultClient};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -263,7 +263,10 @@ fn group_split_settles_by_shares() {
     let payouts_sum = (creator_after - creator_before)
         + (member_b_after - member_b_before)
         + (member_c_after - member_c_before);
-    assert_eq!(payouts_sum, TOTAL, "payouts must exactly account for the whole pool");
+    assert_eq!(
+        payouts_sum, TOTAL,
+        "payouts must exactly account for the whole pool"
+    );
 
     let group = client.group(&group_id);
     assert_eq!(group.balance, 0, "pool must be fully drained after settle");
