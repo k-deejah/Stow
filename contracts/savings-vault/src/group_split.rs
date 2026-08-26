@@ -2,13 +2,13 @@
 //!
 //! Shares are expressed in basis points (bps) and must sum to 10_000.
 
-use soroban_sdk::{token, Address, Env, Map};
+use soroban_sdk::{token, Address, Env, Map, Vec};
 
 use crate::admin::require_not_paused;
 use crate::error::Error;
 use crate::events::{TOPIC_GROUP_SHARES_SET, TOPIC_GROUP_SPLIT_SETTLED};
 use crate::storage::extend_instance_ttl;
-use crate::types::DataKey;
+use crate::types::{DataKey, Group};
 
 pub const TOTAL_BPS: u32 = 10_000;
 
@@ -44,6 +44,8 @@ pub fn compute_payouts(
 /// Set the per-member split for a group. Creator-only, group must be closed.
 ///
 /// Errors:
+/// - `Unauthorized` if `creator` does not match the stored group creator.
+/// - `GroupClosed` if the group has not been closed yet.
 /// - `InvalidShares` if the bps values do not sum to exactly `TOTAL_BPS`,
 ///   or if any key is not a group member.
 pub fn set_shares(
@@ -56,16 +58,12 @@ pub fn set_shares(
     require_not_paused(env)?;
     creator.require_auth();
 
-    let mut group: crate::types::Group = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Group(group_id))
-        .ok_or(Error::NotFound)?;
+    let key = DataKey::Group(group_id);
+    let mut group: Group = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
 
     if group.creator != creator {
         return Err(Error::Unauthorized);
     }
-
     if group.open {
         return Err(Error::GroupClosed);
     }
@@ -77,38 +75,41 @@ pub fn set_shares(
         }
         total = total.checked_add(bps).ok_or(Error::InvalidShares)?;
     }
-
     if total != TOTAL_BPS {
         return Err(Error::InvalidShares);
     }
 
     group.shares_bps = shares_bps;
+    env.storage().persistent().set(&key, &group);
 
-    env.storage()
-        .persistent()
-        .set(&DataKey::Group(group_id), &group);
-
-    env.events()
-        .publish((TOPIC_GROUP_SHARES_SET,), (group_id, creator));
+    env.events().publish(
+        (TOPIC_GROUP_SHARES_SET, creator.clone(), group_id),
+        (group_id, creator, group.shares_bps.clone(), env.ledger().timestamp()),
+    );
 
     Ok(())
 }
 
 /// Settle the pool: transfer each member `balance * shares_bps / TOTAL_BPS`.
 ///
-/// - Deterministic and fully drains the pool: any rounding remainder is
-///   assigned to the group creator.
-/// - Errors `InvalidShares` if shares were never configured.
-pub fn settle(env: &Env, _caller: Address, group_id: u64) -> Result<(), Error> {
+/// - Permissionless once shares are configured; `caller` must still sign
+///   (`require_auth`) so every settlement is attributable to a real signer.
+/// - Deterministic and fully drains the pool: any rounding remainder from
+///   floor division is assigned to the first member (the creator), matching
+///   `group::payout_equal`'s convention.
+/// - Errors `InvalidShares` if shares were never configured, `Overflow` if
+///   any per-member computation would not fit in `i128`.
+pub fn settle(env: &Env, caller: Address, group_id: u64) -> Result<(), Error> {
     extend_instance_ttl(env);
     require_not_paused(env)?;
+    caller.require_auth();
 
-    let mut group: crate::types::Group = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Group(group_id))
-        .ok_or(Error::NotFound)?;
+    let key = DataKey::Group(group_id);
+    let mut group: Group = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
 
+    if group.open {
+        return Err(Error::GroupClosed);
+    }
     if group.shares_bps.is_empty() {
         return Err(Error::InvalidShares);
     }
@@ -118,25 +119,46 @@ pub fn settle(env: &Env, _caller: Address, group_id: u64) -> Result<(), Error> {
         .instance()
         .get(&DataKey::Token)
         .ok_or(Error::NotInitialized)?;
-
     let token_client = token::Client::new(env, &token_address);
     let contract_address = env.current_contract_address();
 
-    let payouts = compute_payouts(env, &group.shares_bps, group.balance, &group.creator);
+    let total_balance = group.balance;
+    let now = env.ledger().timestamp();
 
-    for (member, amount) in payouts.iter() {
-        if amount > 0 {
-            token_client.transfer(&contract_address, &member, &amount);
+    // First pass: compute each member's floor share and the running sum, so
+    // any rounding remainder can be assigned deterministically to the first
+    // member (the creator) in the second pass — this is what guarantees the
+    // pool is fully drained even when TOTAL_BPS doesn't divide it evenly.
+    let mut shares: Vec<i128> = Vec::new(env);
+    let mut distributed: i128 = 0;
+    for member in group.members.iter() {
+        let bps = group.shares_bps.get(member.clone()).unwrap_or(0);
+        let raw = total_balance.checked_mul(bps as i128).ok_or(Error::Overflow)?;
+        let share = raw.checked_div(TOTAL_BPS as i128).ok_or(Error::Overflow)?;
+        distributed = distributed.checked_add(share).ok_or(Error::Overflow)?;
+        shares.push_back(share);
+    }
+    let remainder = total_balance.checked_sub(distributed).ok_or(Error::Overflow)?;
+
+    for (index, member) in group.members.iter().enumerate() {
+        let mut share = shares.get(index as u32).unwrap();
+        if index == 0 {
+            share = share.checked_add(remainder).ok_or(Error::Overflow)?;
         }
-        env.events()
-            .publish((TOPIC_GROUP_SPLIT_SETTLED,), (group_id, member, amount));
+        if share == 0 {
+            continue;
+        }
+
+        token_client.transfer(&contract_address, &member, &share);
+
+        env.events().publish(
+            (TOPIC_GROUP_SPLIT_SETTLED, member.clone(), group_id),
+            (group_id, member, share, now),
+        );
     }
 
     group.balance = 0;
-
-    env.storage()
-        .persistent()
-        .set(&DataKey::Group(group_id), &group);
+    env.storage().persistent().set(&key, &group);
 
     Ok(())
 }

@@ -43,7 +43,13 @@ pub enum Error {
     /// Caller is not a member of this group.
     NotAMember = 12,
 
+    // --- arithmetic / limits ---
+    /// A monetary computation would have overflowed or underflowed `i128`.
+    Overflow = 13,
+    /// The admin-configured per-account deposit cap would be exceeded.
+    DepositCapExceeded = 14,
+
     // --- lifecycle (admin) ---
     /// The contract is paused; mutating entrypoints are rejected.
-    Paused = 13,
+    Paused = 15,
 }

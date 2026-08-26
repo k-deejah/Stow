@@ -4,7 +4,7 @@ use soroban_sdk::{Address, Env};
 
 use crate::error::Error;
 use crate::events::{EVENT_SCHEMA_VERSION, TOPIC_ADMIN_SET, TOPIC_INIT};
-use crate::storage::extend_instance_ttl;
+use crate::storage::{self, extend_instance_ttl};
 use crate::types::DataKey;
 
 /// Initialize the vault.
@@ -22,7 +22,8 @@ pub fn initialize(env: &Env, admin: Address, token: Address) -> Result<(), Error
     }
 
     env.storage().instance().set(&DataKey::Admin, &admin);
-    env.storage().instance().set(&DataKey::Token, &token);
+    storage::set_token(env, &token);
+
     env.storage().instance().set(&DataKey::NextLockedId, &0u64);
     env.storage().instance().set(&DataKey::NextGoalId, &0u64);
     env.storage().instance().set(&DataKey::NextGroupId, &0u64);
@@ -30,7 +31,7 @@ pub fn initialize(env: &Env, admin: Address, token: Address) -> Result<(), Error
 
     env.events().publish(
         (TOPIC_INIT,),
-        (admin, token, EVENT_SCHEMA_VERSION),
+        (admin, token, EVENT_SCHEMA_VERSION, env.ledger().timestamp()),
     );
 
     Ok(())
@@ -38,18 +39,12 @@ pub fn initialize(env: &Env, admin: Address, token: Address) -> Result<(), Error
 
 /// Return the configured token address, or `Error::NotInitialized`.
 pub fn token(env: &Env) -> Result<Address, Error> {
-    env.storage()
-        .instance()
-        .get(&DataKey::Token)
-        .ok_or(Error::NotInitialized)
+    storage::get_token(env).ok_or(Error::NotInitialized)
 }
 
 /// Return the configured admin address, or `Error::NotInitialized`.
 pub fn admin(env: &Env) -> Result<Address, Error> {
-    env.storage()
-        .instance()
-        .get(&DataKey::Admin)
-        .ok_or(Error::NotInitialized)
+    storage::get_admin(env).ok_or(Error::NotInitialized)
 }
 
 /// Rotate the admin. Requires `require_auth` from the current admin.
@@ -61,8 +56,10 @@ pub fn set_admin(env: &Env, new_admin: Address) -> Result<(), Error> {
 
     env.storage().instance().set(&DataKey::Admin, &new_admin);
 
-    env.events()
-        .publish((TOPIC_ADMIN_SET,), (current_admin, new_admin));
+    env.events().publish(
+        (TOPIC_ADMIN_SET,),
+        (current_admin, new_admin, env.ledger().timestamp()),
+    );
 
     Ok(())
 }
@@ -98,5 +95,34 @@ pub fn require_not_paused(env: &Env) -> Result<(), Error> {
     if is_paused(env) {
         return Err(Error::Paused);
     }
+    Ok(())
+}
+
+/// The per-account deposit cap, in token stroops. `0` means unlimited.
+///
+/// Defaults to `0` (unlimited) before `set_deposit_cap` has ever been
+/// called.
+pub fn deposit_cap(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::DepositCap).unwrap_or(0)
+}
+
+/// Set the per-account deposit cap. Admin-only. `0` disables the cap.
+///
+/// - Requires `require_auth` from the current admin.
+/// - Errors `InvalidAmount` if `cap < 0`.
+/// - Takes effect immediately: the very next `deposit` call is checked
+///   against the new value.
+pub fn set_deposit_cap(env: &Env, cap: i128) -> Result<(), Error> {
+    extend_instance_ttl(env);
+
+    let admin = storage::get_admin(env).ok_or(Error::NotInitialized)?;
+    admin.require_auth();
+
+    if cap < 0 {
+        return Err(Error::InvalidAmount);
+    }
+
+    env.storage().instance().set(&DataKey::DepositCap, &cap);
+
     Ok(())
 }

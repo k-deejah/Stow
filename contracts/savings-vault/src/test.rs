@@ -9,13 +9,15 @@
 //! the bare contract shell (no token) can still call [`setup`].
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, LedgerInfo},
+    testutils::{Address as _, Events as _, Ledger, LedgerInfo},
     token::StellarAssetClient,
-    Address, Env,
+    Address, Env, IntoVal, Map, String,
 };
 
-use crate::{SavingsVault, SavingsVaultClient};
 use crate::error::Error;
+use crate::events::{TOPIC_DEPOSIT, TOPIC_WITHDRAW};
+use crate::group_split;
+use crate::{SavingsVault, SavingsVaultClient};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -72,13 +74,204 @@ fn flexible_deposit_withdraw() {}
 #[ignore = "TODO(issue): locked withdraw before unlock_at returns StillLocked"]
 fn locked_respects_time_lock() {}
 
-#[test]
-#[ignore = "TODO(issue): goal contribute crossing target sets reached_at"]
-fn goal_reaches_target() {}
+// ---------------------------------------------------------------------------
+// Issue #36 — goal milestone + claim
+// ---------------------------------------------------------------------------
 
+/// Contributing across the target boundary sets `reached_at` exactly once
+/// and emits a `goal_reached` event alongside the `goal_contribution` event;
+/// further contributions after the target is met neither move `reached_at`
+/// nor re-emit the milestone event.
 #[test]
-#[ignore = "TODO(issue): group_split settle pays members by shares and drains pool"]
-fn group_split_settles_by_shares() {}
+fn goal_reaches_target() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TARGET: i128 = 100_000_000; // 100 USDC
+    const FIRST: i128 = 40_000_000; // below target
+    const SECOND: i128 = 70_000_000; // 40 + 70 = 110 -> crosses target
+    const THIRD: i128 = 1_000_000; // contributed after already reached
+
+    mint(&env, &token, &token_admin, &owner, FIRST + SECOND + THIRD);
+
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "holiday"), &TARGET);
+
+    // Contribute below the target: not yet reached. `events().all()` scopes
+    // to the most recent top-level invocation, so this call's log holds
+    // exactly the token transfer + the contribution event (no reached event).
+    client.goal_contribute(&owner, &goal_id, &FIRST);
+    let events_after_first = env.events().all().len();
+
+    let goal = client.goal(&goal_id);
+    assert_eq!(goal.saved_amount, FIRST);
+    assert!(
+        goal.reached_at.is_none(),
+        "goal must not be reached before the target is crossed"
+    );
+    assert_eq!(
+        events_after_first, 2,
+        "a below-target contribution emits a transfer and a contribution event, no reached event"
+    );
+
+    // Contribute across the target boundary: reached_at set, and this
+    // call's event log additionally carries the reached event.
+    client.goal_contribute(&owner, &goal_id, &SECOND);
+    let events_after_second = env.events().all().len();
+
+    let goal = client.goal(&goal_id);
+    assert_eq!(goal.saved_amount, FIRST + SECOND);
+    assert!(
+        goal.reached_at.is_some(),
+        "reached_at must be set once the target is crossed"
+    );
+    let reached_at_first = goal.reached_at;
+    assert_eq!(
+        events_after_second, 3,
+        "crossing the target emits a transfer, contribution, and reached event"
+    );
+
+    // Contribute again after already reached: reached_at unchanged, and no
+    // reached event shows up in this call's log.
+    client.goal_contribute(&owner, &goal_id, &THIRD);
+    let events_after_third = env.events().all().len();
+
+    let goal = client.goal(&goal_id);
+    assert_eq!(
+        goal.reached_at, reached_at_first,
+        "reached_at must be set only once"
+    );
+    assert_eq!(
+        events_after_third, 2,
+        "a post-target contribution does not re-emit the reached event"
+    );
+}
+
+/// Claiming a reached goal transfers the full saved balance back to the
+/// owner and closes the goal so it cannot be claimed a second time.
+#[test]
+fn goal_claim_after_reached_returns_funds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TARGET: i128 = 100_000_000; // 100 USDC
+
+    mint(&env, &token, &token_admin, &owner, TARGET);
+
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "holiday"), &TARGET);
+    client.goal_contribute(&owner, &goal_id, &TARGET);
+
+    let goal = client.goal(&goal_id);
+    assert!(goal.reached_at.is_some(), "goal must be reached before claim");
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let owner_balance_before_claim = token_client.balance(&owner);
+
+    client.goal_claim(&owner, &goal_id);
+
+    let owner_balance_after_claim = token_client.balance(&owner);
+    assert_eq!(
+        owner_balance_after_claim - owner_balance_before_claim,
+        TARGET,
+        "claim must return the full saved amount to the owner"
+    );
+
+    // The goal is closed on claim; a second claim finds nothing to pay out.
+    let result = client.try_goal_claim(&owner, &goal_id);
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+/// Closing a group, assigning shares, and settling pays each member their
+/// bps-weighted portion of the pooled contributions and fully drains the
+/// group balance. Shares (34%/33%/33%) don't divide the pool evenly, so this
+/// also exercises the rule that the creator (first member) absorbs the
+/// rounding remainder.
+#[test]
+fn group_split_settles_by_shares() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let member_b = Address::generate(&env);
+    let member_c = Address::generate(&env);
+
+    const CREATOR_CONTRIB: i128 = 50_000_000;
+    const MEMBER_B_CONTRIB: i128 = 30_000_000;
+    const MEMBER_C_CONTRIB: i128 = 20_000_000;
+    const TOTAL: i128 = CREATOR_CONTRIB + MEMBER_B_CONTRIB + MEMBER_C_CONTRIB;
+
+    mint(&env, &token, &token_admin, &creator, CREATOR_CONTRIB);
+    mint(&env, &token, &token_admin, &member_b, MEMBER_B_CONTRIB);
+    mint(&env, &token, &token_admin, &member_c, MEMBER_C_CONTRIB);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "split-pool"));
+    client.group_join(&member_b, &group_id);
+    client.group_join(&member_c, &group_id);
+
+    client.group_contribute(&creator, &group_id, &CREATOR_CONTRIB);
+    client.group_contribute(&member_b, &group_id, &MEMBER_B_CONTRIB);
+    client.group_contribute(&member_c, &group_id, &MEMBER_C_CONTRIB);
+
+    client.group_close(&creator, &group_id);
+
+    let mut shares = Map::new(&env);
+    shares.set(creator.clone(), 3_334u32); // 33.34%
+    shares.set(member_b.clone(), 3_333u32); // 33.33%
+    shares.set(member_c.clone(), 3_333u32); // 33.33%
+    client.group_set_shares(&creator, &group_id, &shares);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let creator_before = token_client.balance(&creator);
+    let member_b_before = token_client.balance(&member_b);
+    let member_c_before = token_client.balance(&member_c);
+
+    client.group_settle(&creator, &group_id);
+
+    let creator_after = token_client.balance(&creator);
+    let member_b_after = token_client.balance(&member_b);
+    let member_c_after = token_client.balance(&member_c);
+
+    let member_b_payout = TOTAL * 3_333 / group_split::TOTAL_BPS as i128;
+    let member_c_payout = TOTAL * 3_333 / group_split::TOTAL_BPS as i128;
+    let creator_floor_payout = TOTAL * 3_334 / group_split::TOTAL_BPS as i128;
+    let remainder = TOTAL - creator_floor_payout - member_b_payout - member_c_payout;
+
+    assert_eq!(
+        member_b_after - member_b_before,
+        member_b_payout,
+        "member B must receive their bps-weighted share"
+    );
+    assert_eq!(
+        member_c_after - member_c_before,
+        member_c_payout,
+        "member C must receive their bps-weighted share"
+    );
+    assert_eq!(
+        creator_after - creator_before,
+        creator_floor_payout + remainder,
+        "creator (first member) must receive their share plus the rounding remainder"
+    );
+
+    let payouts_sum = (creator_after - creator_before)
+        + (member_b_after - member_b_before)
+        + (member_c_after - member_c_before);
+    assert_eq!(
+        payouts_sum, TOTAL,
+        "payouts must exactly account for the whole pool"
+    );
+
+    let group = client.group(&group_id);
+    assert_eq!(group.balance, 0, "pool must be fully drained after settle");
+}
 
 // ---------------------------------------------------------------------------
 // Issue #40 — InsufficientBalance rejection
@@ -681,6 +874,604 @@ fn initialize_twice_rejected() {
         Err(Ok(Error::AlreadyInitialized)),
         "initialize must be callable exactly once",
     );
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Issue #31 — Auth review: require_auth on all mutations
+//
+// Two ways an unauthorized call is rejected (see the case 1 / case 2 recap
+// above the #39 tests):
+//
+//  1. No valid authorization exists for the principal at all — disabling
+//     mocked auth (`env.set_auths(&[])`) or never enabling it means the
+//     principal's `require_auth()` call inside the contract has nothing to
+//     match, so the host rejects the invocation and `try_*` returns
+//     `Err(Err(_))`.
+//  2. The principal *did* authorize (any signer can under `mock_all_auths`),
+//     but the contract compares the claimed identity against a stored
+//     owner/creator field and returns a typed `Error::Unauthorized`.
+//
+// These tests cover every state-changing entrypoint touched by this issue in
+// flexible.rs, locked.rs, and group.rs.
+// ---------------------------------------------------------------------------
+
+/// `deposit` must require `from`'s authorization — funding isn't needed
+/// since the auth check happens before anything else.
+#[test]
+fn deposit_without_signer_auth_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token) = setup_with_token(&env);
+    let user = Address::generate(&env);
+
+    let result = client.try_deposit(&user, &10_000_000i128);
+
+    assert!(
+        result.is_err(),
+        "deposit must fail without `from`'s authorization"
+    );
+}
+
+/// `withdraw` must require `owner`'s authorization.
+#[test]
+fn withdraw_without_signer_auth_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const AMOUNT: i128 = 20_000_000;
+    mint(&env, &token, &token_admin, &owner, AMOUNT);
+    client.deposit(&owner, &AMOUNT);
+
+    // Disable mocking: no more auths are considered valid from here on.
+    env.set_auths(&[]);
+
+    let result = client.try_withdraw(&owner, &AMOUNT);
+    assert!(
+        result.is_err(),
+        "withdraw must fail without `owner`'s authorization"
+    );
+}
+
+/// `locked_create` must require `owner`'s authorization.
+#[test]
+fn locked_create_without_signer_auth_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+
+    let result = client.try_locked_create(&owner, &10_000_000i128, &1_000u64);
+
+    assert!(
+        result.is_err(),
+        "locked_create must fail without `owner`'s authorization"
+    );
+}
+
+/// `locked_top_up` must reject a caller who is not the plan's owner, even
+/// though they validly authorized *themselves* (case 2).
+#[test]
+fn locked_top_up_by_non_owner_rejected_issue31() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    const AMOUNT: i128 = 30_000_000;
+    mint(&env, &token, &token_admin, &owner, AMOUNT);
+    mint(&env, &token, &token_admin, &attacker, AMOUNT);
+
+    let plan_id = client.locked_create(&owner, &AMOUNT, &1_000_000u64);
+
+    let result = client.try_locked_top_up(&attacker, &plan_id, &AMOUNT);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Unauthorized)),
+        "attacker must not top-up another user's locked plan",
+    );
+
+    let plan = client.locked_plan(&plan_id);
+    assert_eq!(plan.balance, AMOUNT, "plan balance must be untouched");
+}
+
+/// `locked_withdraw` must reject a caller who is not the plan's owner.
+#[test]
+fn locked_withdraw_by_non_owner_rejected_issue31() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    const AMOUNT: i128 = 40_000_000;
+    mint(&env, &token, &token_admin, &owner, AMOUNT);
+
+    // `min_persistent_entry_ttl` set well above the sequence-number jump
+    // below (100 -> 200) so the `LockedPlan` entry is not archived before
+    // the withdrawal attempt — this test is about the ownership check, not
+    // persistent-entry TTL behavior.
+    let now: u64 = 1_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 3_110_400,
+        max_entry_ttl: 3_110_400,
+    });
+    let unlock_at = now + 500;
+    let plan_id = client.locked_create(&owner, &AMOUNT, &unlock_at);
+
+    env.ledger().set(LedgerInfo {
+        timestamp: unlock_at + 1,
+        protocol_version: 22,
+        sequence_number: 200,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 3_110_400,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let result = client.try_locked_withdraw(&attacker, &plan_id, &AMOUNT);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Unauthorized)),
+        "attacker must not withdraw from another user's locked plan",
+    );
+
+    let plan = client.locked_plan(&plan_id);
+    assert_eq!(plan.balance, AMOUNT, "plan balance must be untouched");
+}
+
+/// `group_payout_equal` was missing `require_auth` on `caller` entirely —
+/// anyone could relay the call unauthenticated. It is intentionally
+/// permissionless (payouts go to members, not to `caller`), but every
+/// invocation must still be attributable to a real signer.
+#[test]
+fn group_payout_equal_without_signer_auth_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    const AMOUNT: i128 = 10_000_000;
+    mint(&env, &token, &token_admin, &creator, AMOUNT);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "payout-auth"));
+    client.group_contribute(&creator, &group_id, &AMOUNT);
+    client.group_close(&creator, &group_id);
+
+    // Disable mocking: `caller.require_auth()` now has nothing to match.
+    env.set_auths(&[]);
+
+    let result = client.try_group_payout_equal(&creator, &group_id);
+    assert!(
+        result.is_err(),
+        "group_payout_equal must fail without a signed caller",
+    );
+}
+
+/// `set_admin` must require the *current* admin's authorization.
+#[test]
+fn set_admin_without_admin_auth_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token) = setup_with_token(&env);
+    let new_admin = Address::generate(&env);
+
+    let result = client.try_set_admin(&new_admin);
+
+    assert!(
+        result.is_err(),
+        "set_admin must fail without the current admin's authorization"
+    );
+}
+
+/// `set_deposit_cap` must require the current admin's authorization.
+#[test]
+fn set_deposit_cap_without_admin_auth_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token) = setup_with_token(&env);
+
+    let result = client.try_set_deposit_cap(&100_000_000i128);
+
+    assert!(
+        result.is_err(),
+        "set_deposit_cap must fail without the admin's authorization"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #32 — Overflow-safe i128 arithmetic audit
+// ---------------------------------------------------------------------------
+
+/// Depositing into an account already at `i128::MAX` must return a typed
+/// `Overflow` error instead of panicking or wrapping, and must leave the
+/// balance untouched.
+#[test]
+fn deposit_overflow_rejected_with_typed_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    mint(&env, &token, &token_admin, &user, i128::MAX);
+    client.deposit(&user, &i128::MAX);
+
+    mint(&env, &token, &token_admin, &user, 1);
+    let result = client.try_deposit(&user, &1);
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::Overflow)),
+        "depositing past i128::MAX must return a typed Overflow error",
+    );
+
+    let account = client.get_account(&user);
+    assert_eq!(
+        account.balance,
+        i128::MAX,
+        "balance must be unchanged after a rejected overflowing deposit",
+    );
+}
+
+/// `group_split::settle` must reject a per-member share computation that
+/// would overflow `i128` with a typed error, rather than panicking, and
+/// must leave the pool balance untouched (settlement did not proceed).
+#[test]
+fn group_split_settle_overflow_rejected_with_typed_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let member = Address::generate(&env);
+
+    // Large enough that `balance * 5_000` overflows i128.
+    const HALF: i128 = i128::MAX / 2;
+
+    mint(&env, &token, &token_admin, &creator, HALF);
+    mint(&env, &token, &token_admin, &member, HALF);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "overflow-pool"));
+    client.group_join(&member, &group_id);
+    client.group_contribute(&creator, &group_id, &HALF);
+    client.group_contribute(&member, &group_id, &HALF);
+    client.group_close(&creator, &group_id);
+
+    let mut shares = Map::new(&env);
+    shares.set(creator.clone(), 5_000u32);
+    shares.set(member.clone(), 5_000u32);
+    client.group_set_shares(&creator, &group_id, &shares);
+
+    let result = client.try_group_settle(&creator, &group_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Overflow)),
+        "settling a pool whose balance*bps overflows i128 must return a typed error",
+    );
+
+    let group = client.group(&group_id);
+    assert_eq!(
+        group.balance,
+        HALF + HALF,
+        "pool must be untouched after a rejected overflowing settle",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #48 — Per-account deposit cap policy
+// ---------------------------------------------------------------------------
+
+/// With no cap ever configured (defaults to `0`), deposits of any size
+/// succeed.
+#[test]
+fn deposit_cap_defaults_to_unlimited() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const LARGE: i128 = 1_000_000_000_000;
+    mint(&env, &token, &token_admin, &user, LARGE);
+    client.deposit(&user, &LARGE);
+
+    let account = client.get_account(&user);
+    assert_eq!(account.balance, LARGE);
+}
+
+/// A deposit that lands exactly on the configured cap succeeds.
+#[test]
+fn deposit_at_cap_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const CAP: i128 = 100_000_000;
+    client.set_deposit_cap(&CAP);
+
+    mint(&env, &token, &token_admin, &user, CAP);
+    client.deposit(&user, &CAP);
+
+    let account = client.get_account(&user);
+    assert_eq!(account.balance, CAP);
+}
+
+/// A deposit that would push the balance past the configured cap is
+/// rejected, and the balance is left unchanged.
+#[test]
+fn deposit_beyond_cap_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const CAP: i128 = 100_000_000;
+    client.set_deposit_cap(&CAP);
+
+    mint(&env, &token, &token_admin, &user, CAP + 1);
+    client.deposit(&user, &CAP);
+
+    let result = client.try_deposit(&user, &1);
+    assert_eq!(
+        result,
+        Err(Ok(Error::DepositCapExceeded)),
+        "deposit pushing balance past the cap must be rejected",
+    );
+
+    let account = client.get_account(&user);
+    assert_eq!(account.balance, CAP, "balance must not change on a rejected deposit");
+}
+
+/// Raising the cap takes effect immediately: a deposit that was rejected
+/// under the old (lower) cap succeeds once the admin raises it, without
+/// needing to re-deploy or wait.
+#[test]
+fn deposit_cap_change_takes_effect_immediately() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const CAP_LOW: i128 = 10_000_000;
+    const CAP_HIGH: i128 = 50_000_000;
+    const AMOUNT: i128 = CAP_LOW + 1;
+
+    client.set_deposit_cap(&CAP_LOW);
+    mint(&env, &token, &token_admin, &user, AMOUNT);
+
+    let result = client.try_deposit(&user, &AMOUNT);
+    assert_eq!(result, Err(Ok(Error::DepositCapExceeded)));
+
+    client.set_deposit_cap(&CAP_HIGH);
+
+    client.deposit(&user, &AMOUNT);
+    let account = client.get_account(&user);
+    assert_eq!(account.balance, AMOUNT);
+}
+
+/// A negative cap is rejected as an invalid amount.
+#[test]
+fn set_deposit_cap_rejects_negative() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+
+    let result = client.try_set_deposit_cap(&-1i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+// ---------------------------------------------------------------------------
+// goal::get_goal
+// ---------------------------------------------------------------------------
+
+/// `goal()` returns the goal as created, and errors `NotFound` for an id
+/// that was never created.
+#[test]
+fn get_goal_returns_created_goal_and_not_found_for_unknown_id() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TARGET: i128 = 100_000_000;
+    const CONTRIBUTION: i128 = 40_000_000;
+
+    mint(&env, &token, &token_admin, &owner, CONTRIBUTION);
+
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "holiday"), &TARGET);
+    client.goal_contribute(&owner, &goal_id, &CONTRIBUTION);
+
+    let goal = client.goal(&goal_id);
+    assert_eq!(goal.id, goal_id);
+    assert_eq!(goal.owner, owner);
+    assert_eq!(goal.target_amount, TARGET);
+    assert_eq!(goal.saved_amount, CONTRIBUTION);
+    assert!(goal.reached_at.is_none());
+
+    let result = client.try_goal(&(goal_id + 1));
+    assert!(
+        matches!(result, Err(Ok(Error::NotFound))),
+        "expected Err(Ok(Error::NotFound)) for an unknown goal id"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// group_split::set_shares
+// ---------------------------------------------------------------------------
+
+/// Shares whose bps values don't sum to `TOTAL_BPS` are rejected, and the
+/// group's stored shares are left untouched.
+#[test]
+fn group_set_shares_rejects_invalid_sum() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+    let member_b = Address::generate(&env);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "split-pool"));
+    client.group_join(&member_b, &group_id);
+    client.group_close(&creator, &group_id);
+
+    let mut shares = Map::new(&env);
+    shares.set(creator.clone(), 5_000u32);
+    shares.set(member_b.clone(), 4_000u32); // 5_000 + 4_000 = 9_000 != TOTAL_BPS
+
+    let result = client.try_group_set_shares(&creator, &group_id, &shares);
+    assert_eq!(result, Err(Ok(Error::InvalidShares)));
+}
+
+/// A shares map naming an address that never joined the group is rejected,
+/// even if the bps values would otherwise sum correctly.
+#[test]
+fn group_set_shares_rejects_non_member_key() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+    let member_b = Address::generate(&env);
+    let outsider = Address::generate(&env);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "split-pool"));
+    client.group_join(&member_b, &group_id);
+    client.group_close(&creator, &group_id);
+
+    let mut shares = Map::new(&env);
+    shares.set(creator.clone(), 5_000u32);
+    shares.set(outsider.clone(), 5_000u32); // outsider never joined
+
+    let result = client.try_group_set_shares(&creator, &group_id, &shares);
+    assert_eq!(result, Err(Ok(Error::InvalidShares)));
+}
+
+/// Valid shares that sum to exactly `TOTAL_BPS` and name only group members
+/// are stored and emit a `group_shares_set` event.
+#[test]
+fn group_set_shares_stores_valid_shares() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+    let member_b = Address::generate(&env);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "split-pool"));
+    client.group_join(&member_b, &group_id);
+    client.group_close(&creator, &group_id);
+
+    let mut shares = Map::new(&env);
+    shares.set(creator.clone(), 6_000u32);
+    shares.set(member_b.clone(), 4_000u32);
+
+    client.group_set_shares(&creator, &group_id, &shares);
+    let event_count = env.events().all().len();
+    assert_eq!(
+        event_count, 1,
+        "set_shares emits exactly one group_shares_set event"
+    );
+
+    let group = client.group(&group_id);
+    assert_eq!(group.shares_bps.get(creator.clone()), Some(6_000u32));
+    assert_eq!(group.shares_bps.get(member_b.clone()), Some(4_000u32));
+}
+
+// ---------------------------------------------------------------------------
+// flexible::deposit / flexible::withdraw events
+// ---------------------------------------------------------------------------
+
+/// `deposit` emits a `deposit` event with the (from, amount, new_balance,
+/// timestamp) data tuple described in the events registry.
+#[test]
+fn deposit_emits_typed_event_with_expected_topic_and_data() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const AMOUNT: i128 = 25_000_000;
+
+    mint(&env, &token, &token_admin, &user, AMOUNT);
+
+    client.deposit(&user, &AMOUNT);
+
+    let now = env.ledger().timestamp();
+    let events = env.events().all();
+    let (contract_id, topics, data) = events.last().unwrap().clone();
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (TOPIC_DEPOSIT, user.clone()).into_val(&env);
+    let decoded_data: (Address, i128, i128, u64) =
+        soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap();
+
+    assert_eq!(contract_id, client.address);
+    assert_eq!(topics, expected_topics);
+    assert_eq!(decoded_data, (user, AMOUNT, AMOUNT, now));
+}
+
+/// `withdraw` emits a `withdraw` event with the (owner, amount,
+/// new_balance, timestamp) data tuple described in the events registry.
+#[test]
+fn withdraw_emits_typed_event_with_expected_topic_and_data() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const DEPOSIT_AMOUNT: i128 = 25_000_000;
+    const WITHDRAW_AMOUNT: i128 = 10_000_000;
+
+    mint(&env, &token, &token_admin, &user, DEPOSIT_AMOUNT);
+    client.deposit(&user, &DEPOSIT_AMOUNT);
+
+    client.withdraw(&user, &WITHDRAW_AMOUNT);
+
+    let now = env.ledger().timestamp();
+    let events = env.events().all();
+    let (contract_id, topics, data) = events.last().unwrap().clone();
+    let remaining_balance = DEPOSIT_AMOUNT - WITHDRAW_AMOUNT;
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (TOPIC_WITHDRAW, user.clone()).into_val(&env);
+    let decoded_data: (Address, i128, i128, u64) =
+        soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap();
+
+    assert_eq!(contract_id, client.address);
+    assert_eq!(topics, expected_topics);
+    assert_eq!(decoded_data, (user, WITHDRAW_AMOUNT, remaining_balance, now));
 }
 
 // ---------------------------------------------------------------------------
