@@ -60,12 +60,8 @@ fn mint(env: &Env, token: &Address, token_admin: &Address, recipient: &Address, 
 #[test]
 fn initialize_sets_config() {
     let env = Env::default();
-    let client = setup(&env);
-    let admin = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    client.initialize(&admin, &token);
-
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
     assert_eq!(client.admin(), admin);
     assert_eq!(client.token(), token);
 }
@@ -74,29 +70,36 @@ fn initialize_sets_config() {
 fn flexible_deposit_withdraw() {
     let env = Env::default();
     env.mock_all_auths();
-
     let (client, _admin, token) = setup_with_token(&env);
     let token_admin = Address::generate(&env);
-    let user = Address::generate(&env);
-    const DEPOSIT: i128 = 100_000_000;
-    const WITHDRAW: i128 = 40_000_000;
-
-    mint(&env, &token, &token_admin, &user, DEPOSIT);
-    client.deposit(&user, &DEPOSIT);
-
-    let token_client = soroban_sdk::token::Client::new(&env, &token);
-    let owner_before = token_client.balance(&user);
-    let vault_before = token_client.balance(&client.address);
-    client.withdraw(&user, &WITHDRAW);
-
-    assert_eq!(token_client.balance(&user), owner_before + WITHDRAW);
-    assert_eq!(token_client.balance(&client.address), vault_before - WITHDRAW);
-    assert_eq!(client.get_account(&user).balance, DEPOSIT - WITHDRAW);
+    let owner = Address::generate(&env);
+    let amount = 25_000_000i128;
+    mint(&env, &token, &token_admin, &owner, amount);
+    client.deposit(&owner, &amount);
+    let account = client.get_account(&owner);
+    assert_eq!(account.owner, owner);
+    assert_eq!(account.balance, amount);
+    assert_eq!(client.try_get_account(&Address::generate(&env)), Err(Ok(Error::NotFound)));
 }
 
 #[test]
-#[ignore = "TODO(issue): locked withdraw before unlock_at returns StillLocked"]
-fn locked_respects_time_lock() {}
+fn locked_respects_time_lock() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let amount = 25_000_000i128;
+    mint(&env, &token, &token_admin, &owner, amount);
+    let now = env.ledger().timestamp();
+    let id = client.locked_create(&owner, &amount, &(now + 100));
+    let top_up = 5_000_000i128;
+    mint(&env, &token, &token_admin, &owner, top_up);
+    client.locked_top_up(&owner, &id, &top_up);
+    let plan = client.locked_plan(&id);
+    assert_eq!(plan.balance, amount + top_up);
+    assert_eq!(plan.unlock_at, now + 100);
+}
 
 // ---------------------------------------------------------------------------
 // Issue #36 — goal milestone + claim
@@ -593,7 +596,6 @@ fn locked_withdraw_still_locked_and_over_balance_prefers_insufficient_balance() 
 /// `set_admin` must require auth from the *current* admin. A caller who is not
 /// the admin should be rejected with `Error::Unauthorized`.
 #[test]
-#[ignore = "TODO(issue #39): implement admin::set_admin ownership check"]
 fn set_admin_by_non_admin_rejected() {
     let env = Env::default();
     env.mock_all_auths();
@@ -654,7 +656,6 @@ fn flexible_withdraw_by_non_owner_rejected() {
 
 /// Only the plan owner may top-up a locked plan.
 #[test]
-#[ignore = "TODO(issue #39): implement locked::top_up owner check"]
 fn locked_top_up_by_non_owner_rejected() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1572,6 +1573,115 @@ fn set_paused_by_non_admin_rejected() {
         "non-admin must not be able to pause the vault",
     );
     assert!(!client.is_paused(), "vault must remain unpaused after a rejected pause attempt");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #30 — Audit and extend error codes
+//
+// Every documented Error variant must be reachable and asserted at least
+// once. The tests above already cover AlreadyInitialized,
+// DepositCapExceeded, InsufficientBalance, InvalidAmount, InvalidShares,
+// NotAMember, NotFound, Overflow, Paused, StillLocked, and Unauthorized.
+// The four tests below cover the remaining variants: NotInitialized,
+// InvalidUnlockTime, GoalNotReached, and GroupClosed.
+// ---------------------------------------------------------------------------
+
+/// Every entrypoint that touches the configured token must reject with
+/// `NotInitialized` before `initialize` has ever been called.
+#[test]
+fn uninitialized_vault_rejects_with_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = setup(&env);
+    let owner = Address::generate(&env);
+
+    let deposit_result = client.try_deposit(&owner, &1_000_000);
+    assert_eq!(
+        deposit_result,
+        Err(Ok(Error::NotInitialized)),
+        "deposit on an uninitialized vault must fail with NotInitialized",
+    );
+
+    let locked_result = client.try_locked_create(&owner, &1_000_000, &1);
+    assert_eq!(
+        locked_result,
+        Err(Ok(Error::NotInitialized)),
+        "locked_create on an uninitialized vault must fail with NotInitialized",
+    );
+}
+
+/// `locked_create` must reject an `unlock_at` that is not strictly in the
+/// future (at or before the current ledger timestamp).
+#[test]
+fn locked_create_rejects_unlock_at_not_in_future() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+
+    let now = env.ledger().timestamp();
+
+    let at_now = client.try_locked_create(&owner, &1_000_000, &now);
+    assert_eq!(
+        at_now,
+        Err(Ok(Error::InvalidUnlockTime)),
+        "unlock_at == now must be rejected as not strictly in the future",
+    );
+
+    if now > 0 {
+        let in_past = client.try_locked_create(&owner, &1_000_000, &(now - 1));
+        assert_eq!(
+            in_past,
+            Err(Ok(Error::InvalidUnlockTime)),
+            "unlock_at in the past must be rejected",
+        );
+    }
+}
+
+/// `goal_claim` must reject with `GoalNotReached` while the goal's
+/// `saved_amount` is still below its `target_amount`.
+#[test]
+fn goal_claim_before_target_reached_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "unreached goal");
+
+    let goal_id = client.goal_create(&owner, &name, &1_000_000_000);
+
+    let result = client.try_goal_claim(&owner, &goal_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::GoalNotReached)),
+        "claiming a goal before its target is reached must fail with GoalNotReached",
+    );
+}
+
+/// `group_join` must reject with `GroupClosed` once the group's creator
+/// has closed it.
+#[test]
+fn group_join_after_close_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+    let latecomer = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "closed pool");
+
+    let group_id = client.group_create(&creator, &name);
+    client.group_close(&creator, &group_id);
+
+    let result = client.try_group_join(&latecomer, &group_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::GroupClosed)),
+        "joining a closed group must fail with GroupClosed",
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -8,18 +8,29 @@ import { AnchorService } from './anchor.service';
 import { AnchorDeposit } from './entities/anchor-deposit.entity';
 import { Balance } from './entities/balance.entity';
 import { Group } from './entities/group.entity';
+import { GroupMember } from './entities/group-member.entity';
 import { BalanceService } from './balance.service';
 import { GroupsService } from './groups.service';
+import { LockedPlansService } from './locked-plans.service';
 import { BalanceController } from './balance.controller';
+import { SavingsController } from './savings.controller';
+import { SavingsService } from './savings.service';
 import { WebhooksModule } from '../webhooks/webhooks.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([AnchorDeposit, Balance, Group]),
+    TypeOrmModule.forFeature([AnchorDeposit, Balance, Group, GroupMember]),
     CacheModule.register({ ttl: 10_000 }),
+    GoalsModule,
   ],
-  controllers: [AnchorController, BalanceController],
-  providers: [AnchorService, BalanceService, GroupsService],
-  exports: [AnchorService, BalanceService, GroupsService],
+  controllers: [AnchorController, BalanceController, SavingsController],
+  providers: [
+    AnchorService,
+    BalanceService,
+    GroupsService,
+    LockedPlansService,
+    SavingsService,
+  ],
+  exports: [AnchorService, BalanceService, GroupsService, LockedPlansService],
 })
 export class SavingsModule {}
