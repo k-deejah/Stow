@@ -42,6 +42,27 @@ export interface SorobanRpcEvent {
 export interface SorobanEventsResponse {
   events: SorobanRpcEvent[];
   latestLedger: number;
+  /**
+   * Opaque RPC cursor (= last event id from the final page).
+   * Pass back into `getEvents` as `options.cursor` to continue from where
+   * this response left off without re-specifying `startLedger`.
+   */
+  cursor?: string;
+}
+
+/** Options that control paging behaviour for `getEvents`. */
+export interface GetEventsOptions {
+  /**
+   * Maximum number of events to return per RPC call.
+   * Capped at `MAX_PAGE_SIZE` (200). Defaults to `MAX_PAGE_SIZE`.
+   */
+  limit?: number;
+  /**
+   * Resume from a cursor returned by a previous call.
+   * When provided `startLedger` is omitted from the RPC request — the two
+   * params are mutually exclusive in the Soroban JSON-RPC spec.
+   */
+  cursor?: string;
 }
 
 export interface SorobanDisputeResult {
@@ -603,56 +624,171 @@ export class SorobanService {
     });
   }
 
-  async getEvents(fromLedger: number): Promise<SorobanEventsResponse> {
-    return this.withSorobanErrorHandling('getEvents', async () => {
-      if (!this.rpcUrl || !this.contractId) {
-        this.logger.warn(
-          'SOROBAN_RPC_URL or SOROBAN_CONTRACT_ID is not configured; skipping event poll',
-        );
-        return { events: [], latestLedger: fromLedger };
+  /**
+   * Fetch contract events from the Soroban RPC node with full cursor-based
+   * paging support.
+   *
+   * Behaviour:
+   * - Iterates through RPC pages until one of the following stop conditions
+   *   is met:
+   *     1. The RPC returns an empty event list (no more events in range).
+   *     2. The highest ledger seen on the current page has reached or
+   *        exceeded `latestLedger` reported by the RPC (we are at chain
+   *        tip — no point fetching further).
+   *     3. The total number of events accumulated has reached
+   *        `MAX_EVENTS_PER_FETCH` (circuit-breaker for unexpectedly large
+   *        ranges; callers can resume using the returned `cursor`).
+   * - On an RPC-level error the loop exits cleanly and returns whatever
+   *   events were collected up to that point, plus the last known
+   *   `latestLedger`. This intentionally avoids losing the checkpoint:
+   *   callers can persist the returned `cursor` and retry from there.
+   * - `startLedger` and `cursor` are mutually exclusive in the Soroban
+   *   JSON-RPC spec.  When `options.cursor` is provided `startLedger` is
+   *   omitted so the RPC resumes from the cursor position.
+   *
+   * @param fromLedger  The ledger sequence to start from (used only when
+   *                    no cursor is provided).
+   * @param options     Optional paging controls (cursor, per-page limit).
+   */
+  async getEvents(
+    fromLedger: number,
+    options: GetEventsOptions = {},
+  ): Promise<SorobanEventsResponse> {
+    if (!this.rpcUrl || !this.contractId) {
+      this.logger.warn(
+        'SOROBAN_RPC_URL or SOROBAN_CONTRACT_ID is not configured; skipping event poll',
+      );
+      return { events: [], latestLedger: fromLedger };
+    }
+
+    const pageSize = Math.min(
+      options.limit ?? SorobanService.MAX_PAGE_SIZE,
+      SorobanService.MAX_PAGE_SIZE,
+    );
+
+    const accumulated: SorobanRpcEvent[] = [];
+    let activeCursor: string | undefined = options.cursor;
+    let latestLedger = fromLedger;
+    let lastCursor: string | undefined;
+
+    while (accumulated.length < SorobanService.MAX_EVENTS_PER_FETCH) {
+      // Build the JSON-RPC params.  `startLedger` and `cursor` are mutually
+      // exclusive: include `startLedger` only on the very first page when no
+      // resume cursor has been supplied.
+      const pagination: Record<string, unknown> = { limit: pageSize };
+      if (activeCursor) {
+        pagination.cursor = activeCursor;
       }
 
-      const response = await fetch(this.rpcUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 'insightarena-events',
-          method: 'getEvents',
-          params: {
-            startLedger: fromLedger,
-            filters: [{ type: 'contract', contractIds: [this.contractId] }],
-            limit: 200,
-          },
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Soroban RPC error: HTTP ${response.status}`);
+      const params: Record<string, unknown> = {
+        filters: [{ type: 'contract', contractIds: [this.contractId] }],
+        pagination,
+      };
+      if (!activeCursor) {
+        params.startLedger = fromLedger;
       }
 
-      const body = (await response.json()) as {
-        error?: { message?: string };
-        result?: { events?: unknown[]; latestLedger?: number };
+      let body: {
+        error?: { code?: number; message?: string };
+        result?: {
+          events?: unknown[];
+          latestLedger?: number;
+          cursor?: string;
+        };
       };
 
+      try {
+        const response = await fetch(this.rpcUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 'stow-getEvents',
+            method: 'getEvents',
+            params,
+          }),
+        });
+
+        if (!response.ok) {
+          // HTTP-level error — log and break so the caller keeps the
+          // checkpoint at the last successfully retrieved cursor.
+          this.logger.error(
+            `getEvents RPC HTTP error: ${response.status} (cursor=${activeCursor ?? 'none'}, fromLedger=${fromLedger})`,
+          );
+          break;
+        }
+
+        body = (await response.json()) as typeof body;
+      } catch (fetchError) {
+        // Network-level error — same safe-exit strategy.
+        this.logger.error(
+          `getEvents fetch failed: ${(fetchError as Error).message} (cursor=${activeCursor ?? 'none'}, fromLedger=${fromLedger})`,
+        );
+        break;
+      }
+
       if (body.error) {
-        throw new Error(body.error.message ?? 'Unknown Soroban RPC error');
+        // JSON-RPC application error.
+        this.logger.error(
+          `getEvents RPC error ${body.error.code ?? ''}: ${body.error.message ?? 'unknown'} (cursor=${activeCursor ?? 'none'}, fromLedger=${fromLedger})`,
+        );
+        break;
       }
 
       const rawEvents = body.result?.events ?? [];
-      const latestLedger =
-        typeof body.result?.latestLedger === 'number'
-          ? body.result.latestLedger
-          : fromLedger;
 
-      const events: SorobanRpcEvent[] = rawEvents
-        .map((event) => this.normalizeEvent(event))
-        .filter((event): event is SorobanRpcEvent => event !== null);
+      // Update latestLedger from every page so callers always get the most
+      // recent chain-tip value even if the event list is empty.
+      if (typeof body.result?.latestLedger === 'number') {
+        latestLedger = body.result.latestLedger;
+      }
 
-      return { events, latestLedger };
-    });
+      // No events on this page → nothing more to fetch.
+      if (rawEvents.length === 0) {
+        break;
+      }
+
+      const pageEvents: SorobanRpcEvent[] = rawEvents
+        .map((e) => this.normalizeEvent(e))
+        .filter((e): e is SorobanRpcEvent => e !== null);
+
+      accumulated.push(...pageEvents);
+
+      // Track the cursor for this page (= last event id, or the explicit
+      // response-level cursor field if the node returns one).
+      const responseCursor =
+        typeof body.result?.cursor === 'string'
+          ? body.result.cursor
+          : pageEvents.length > 0
+            ? pageEvents[pageEvents.length - 1].id
+            : undefined;
+
+      if (responseCursor) {
+        lastCursor = responseCursor;
+        activeCursor = responseCursor;
+      }
+
+      // Stop when the highest ledger on this page has caught up with the
+      // chain tip — there is nothing further to page through right now.
+      const maxPageLedger = Math.max(...pageEvents.map((e) => e.ledger));
+      if (maxPageLedger >= latestLedger) {
+        break;
+      }
+
+      // Fewer events than requested → last page; no need for another round.
+      if (rawEvents.length < pageSize) {
+        break;
+      }
+    }
+
+    return { events: accumulated, latestLedger, cursor: lastCursor };
   }
+
+  /** Maximum events fetched in a single `getEvents` call (all pages combined). */
+  static readonly MAX_EVENTS_PER_FETCH = 10_000;
+
+  /** Maximum events requested per individual RPC page. */
+  static readonly MAX_PAGE_SIZE = 200;
 
   private async withSorobanErrorHandling<T>(
     operation: string,
