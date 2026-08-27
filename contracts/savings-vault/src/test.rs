@@ -1533,6 +1533,115 @@ fn set_paused_by_non_admin_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #30 — Audit and extend error codes
+//
+// Every documented Error variant must be reachable and asserted at least
+// once. The tests above already cover AlreadyInitialized,
+// DepositCapExceeded, InsufficientBalance, InvalidAmount, InvalidShares,
+// NotAMember, NotFound, Overflow, Paused, StillLocked, and Unauthorized.
+// The four tests below cover the remaining variants: NotInitialized,
+// InvalidUnlockTime, GoalNotReached, and GroupClosed.
+// ---------------------------------------------------------------------------
+
+/// Every entrypoint that touches the configured token must reject with
+/// `NotInitialized` before `initialize` has ever been called.
+#[test]
+fn uninitialized_vault_rejects_with_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = setup(&env);
+    let owner = Address::generate(&env);
+
+    let deposit_result = client.try_deposit(&owner, &1_000_000);
+    assert_eq!(
+        deposit_result,
+        Err(Ok(Error::NotInitialized)),
+        "deposit on an uninitialized vault must fail with NotInitialized",
+    );
+
+    let locked_result = client.try_locked_create(&owner, &1_000_000, &1);
+    assert_eq!(
+        locked_result,
+        Err(Ok(Error::NotInitialized)),
+        "locked_create on an uninitialized vault must fail with NotInitialized",
+    );
+}
+
+/// `locked_create` must reject an `unlock_at` that is not strictly in the
+/// future (at or before the current ledger timestamp).
+#[test]
+fn locked_create_rejects_unlock_at_not_in_future() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+
+    let now = env.ledger().timestamp();
+
+    let at_now = client.try_locked_create(&owner, &1_000_000, &now);
+    assert_eq!(
+        at_now,
+        Err(Ok(Error::InvalidUnlockTime)),
+        "unlock_at == now must be rejected as not strictly in the future",
+    );
+
+    if now > 0 {
+        let in_past = client.try_locked_create(&owner, &1_000_000, &(now - 1));
+        assert_eq!(
+            in_past,
+            Err(Ok(Error::InvalidUnlockTime)),
+            "unlock_at in the past must be rejected",
+        );
+    }
+}
+
+/// `goal_claim` must reject with `GoalNotReached` while the goal's
+/// `saved_amount` is still below its `target_amount`.
+#[test]
+fn goal_claim_before_target_reached_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "unreached goal");
+
+    let goal_id = client.goal_create(&owner, &name, &1_000_000_000);
+
+    let result = client.try_goal_claim(&owner, &goal_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::GoalNotReached)),
+        "claiming a goal before its target is reached must fail with GoalNotReached",
+    );
+}
+
+/// `group_join` must reject with `GroupClosed` once the group's creator
+/// has closed it.
+#[test]
+fn group_join_after_close_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let creator = Address::generate(&env);
+    let latecomer = Address::generate(&env);
+    let name = soroban_sdk::String::from_str(&env, "closed pool");
+
+    let group_id = client.group_create(&creator, &name);
+    client.group_close(&creator, &group_id);
+
+    let result = client.try_group_join(&latecomer, &group_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::GroupClosed)),
+        "joining a closed group must fail with GroupClosed",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #41 — Property test: split rounding sums to pool
 //
 // Weighted settlement must never create or destroy funds via rounding: for
