@@ -58,21 +58,48 @@ fn mint(env: &Env, token: &Address, token_admin: &Address, recipient: &Address, 
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "TODO(issue): initialize stores admin + token"]
 fn initialize_sets_config() {
     let env = Env::default();
-    let _client = setup(&env);
-    let _admin = Address::generate(&env);
-    // TODO: initialize and assert token()/admin readback.
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    assert_eq!(client.admin(), admin);
+    assert_eq!(client.token(), token);
 }
 
 #[test]
-#[ignore = "TODO(issue): flexible deposit then withdraw round-trips balance"]
-fn flexible_deposit_withdraw() {}
+fn flexible_deposit_withdraw() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let amount = 25_000_000i128;
+    mint(&env, &token, &token_admin, &owner, amount);
+    client.deposit(&owner, &amount);
+    let account = client.get_account(&owner);
+    assert_eq!(account.owner, owner);
+    assert_eq!(account.balance, amount);
+    assert_eq!(client.try_get_account(&Address::generate(&env)), Err(Ok(Error::NotFound)));
+}
 
 #[test]
-#[ignore = "TODO(issue): locked withdraw before unlock_at returns StillLocked"]
-fn locked_respects_time_lock() {}
+fn locked_respects_time_lock() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let amount = 25_000_000i128;
+    mint(&env, &token, &token_admin, &owner, amount);
+    let now = env.ledger().timestamp();
+    let id = client.locked_create(&owner, &amount, &(now + 100));
+    let top_up = 5_000_000i128;
+    mint(&env, &token, &token_admin, &owner, top_up);
+    client.locked_top_up(&owner, &id, &top_up);
+    let plan = client.locked_plan(&id);
+    assert_eq!(plan.balance, amount + top_up);
+    assert_eq!(plan.unlock_at, now + 100);
+}
 
 // ---------------------------------------------------------------------------
 // Issue #36 — goal milestone + claim
@@ -550,7 +577,6 @@ fn locked_withdraw_still_locked_and_over_balance_prefers_insufficient_balance() 
 /// `set_admin` must require auth from the *current* admin. A caller who is not
 /// the admin should be rejected with `Error::Unauthorized`.
 #[test]
-#[ignore = "TODO(issue #39): implement admin::set_admin ownership check"]
 fn set_admin_by_non_admin_rejected() {
     let env = Env::default();
     env.mock_all_auths();
@@ -611,7 +637,6 @@ fn flexible_withdraw_by_non_owner_rejected() {
 
 /// Only the plan owner may top-up a locked plan.
 #[test]
-#[ignore = "TODO(issue #39): implement locked::top_up owner check"]
 fn locked_top_up_by_non_owner_rejected() {
     let env = Env::default();
     env.mock_all_auths();
