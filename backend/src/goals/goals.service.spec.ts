@@ -16,7 +16,13 @@ class FakeGoalRepository {
   }
 
   async save(goal: Goal): Promise<Goal> {
-    const saved = { ...goal };
+    // Real TypeORM populates @CreateDateColumn on first insert; mirror that
+    // here so callers (e.g. pagination ordering by created_at) see it set.
+    const existing = this.store.get(goal.on_chain_id);
+    const saved = {
+      ...goal,
+      created_at: existing?.created_at ?? goal.created_at ?? new Date(),
+    };
     this.store.set(saved.on_chain_id, saved);
     return { ...saved };
   }
@@ -34,6 +40,26 @@ class FakeGoalRepository {
       ? all.filter((g) => g.owner === options.where!.owner)
       : all;
     return filtered.map((g) => ({ ...g }));
+  }
+
+  async findAndCount(options: {
+    where: { owner: string };
+    order: { created_at: 'ASC' | 'DESC' };
+    skip: number;
+    take: number;
+  }): Promise<[Goal[], number]> {
+    const filtered = [...this.store.values()].filter(
+      (g) => g.owner === options.where.owner,
+    );
+    const sorted = [...filtered].sort((a, b) =>
+      options.order.created_at === 'ASC'
+        ? a.created_at.getTime() - b.created_at.getTime()
+        : b.created_at.getTime() - a.created_at.getTime(),
+    );
+    const page = sorted
+      .slice(options.skip, options.skip + options.take)
+      .map((g) => ({ ...g }));
+    return [page, filtered.length];
   }
 }
 
@@ -116,5 +142,76 @@ describe('GoalsService – persistence', () => {
     const ownerAGoals = await service.list('OWNER_A');
     expect(ownerAGoals).toHaveLength(1);
     expect(ownerAGoals[0].on_chain_id).toBe('owner-a-goal');
+  });
+});
+
+describe('GoalsService – listByOwnerPaginated', () => {
+  let service: GoalsService;
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        GoalsService,
+        {
+          provide: getRepositoryToken(Goal),
+          useValue: new FakeGoalRepository(),
+        },
+      ],
+    }).compile();
+
+    service = module.get(GoalsService);
+
+    for (let i = 0; i < 25; i++) {
+      await service.upsertCreated({
+        onChainId: `goal-${i}`,
+        owner: 'GOWNER',
+        name: `Goal ${i}`,
+        targetAmount: '100',
+      });
+    }
+    await service.upsertCreated({
+      onChainId: 'other-owner-goal',
+      owner: 'GOTHER',
+      name: 'Not mine',
+      targetAmount: '50',
+    });
+  });
+
+  it("returns only the caller's goals with correct saved/target values", async () => {
+    await service.applyContribution('goal-0', '40');
+
+    const result = await service.listByOwnerPaginated('GOWNER', 1, 100);
+
+    expect(result.total).toBe(25);
+    expect(result.data.every((g) => g.owner === 'GOWNER')).toBe(true);
+    const goal0 = result.data.find((g) => g.on_chain_id === 'goal-0');
+    expect(goal0?.target_amount).toBe('100');
+    expect(goal0?.current_amount).toBe('40');
+  });
+
+  it('paginates correctly across pages', async () => {
+    const page1 = await service.listByOwnerPaginated('GOWNER', 1, 10);
+    const page2 = await service.listByOwnerPaginated('GOWNER', 2, 10);
+    const page3 = await service.listByOwnerPaginated('GOWNER', 3, 10);
+
+    expect(page1.data).toHaveLength(10);
+    expect(page2.data).toHaveLength(10);
+    expect(page3.data).toHaveLength(5);
+    expect(page1.total).toBe(25);
+
+    const allIds = [...page1.data, ...page2.data, ...page3.data].map(
+      (g) => g.on_chain_id,
+    );
+    expect(new Set(allIds).size).toBe(25);
+  });
+
+  it('caps limit at 100 even when a larger value is requested', async () => {
+    const result = await service.listByOwnerPaginated('GOWNER', 1, 500);
+    expect(result.limit).toBe(100);
+  });
+
+  it('returns an empty page for an owner with no goals', async () => {
+    const result = await service.listByOwnerPaginated('GNOBODY');
+    expect(result).toEqual({ data: [], total: 0, page: 1, limit: 20 });
   });
 });

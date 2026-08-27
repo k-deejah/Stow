@@ -11,6 +11,13 @@ export interface GoalSummary {
   total_saved: string;
 }
 
+export interface PaginatedGoals {
+  data: Goal[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
 /**
  * Projects the vault contract's goal events (create/contribute/reached) into
  * the `goals` read-model consumed by the API and by notifications.
@@ -72,6 +79,29 @@ export class GoalsService {
       where: owner ? { owner } : {},
       order: { created_at: 'DESC' },
     });
+  }
+
+  /**
+   * Lists an owner's goals with progress fields, paginated. `limit` is
+   * capped at 100 to bound query cost, matching the convention used by
+   * `NotificationsService.findAllForUser`.
+   */
+  async listByOwnerPaginated(
+    owner: string,
+    page = 1,
+    limit = 20,
+  ): Promise<PaginatedGoals> {
+    const take = Math.min(limit, 100);
+    const skip = (page - 1) * take;
+
+    const [data, total] = await this.goalRepository.findAndCount({
+      where: { owner },
+      order: { created_at: 'DESC' },
+      skip,
+      take,
+    });
+
+    return { data, total, page, limit: take };
   }
 
   async summary(owner?: string): Promise<GoalSummary> {
