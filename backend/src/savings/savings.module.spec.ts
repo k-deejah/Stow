@@ -5,6 +5,9 @@ import { SavingsModule } from './savings.module';
 import { SavingsController } from './savings.controller';
 import { AnchorDeposit } from './entities/anchor-deposit.entity';
 import { Balance } from './entities/balance.entity';
+import { Group } from './entities/group.entity';
+import { LockedPlan } from './entities/locked-plan.entity';
+import { Goal } from '../goals/entities/goal.entity';
 
 describe('SavingsModule', () => {
   let module: TestingModule;
@@ -16,6 +19,12 @@ describe('SavingsModule', () => {
       .overrideProvider(getRepositoryToken(AnchorDeposit))
       .useValue({})
       .overrideProvider(getRepositoryToken(Balance))
+      .useValue({})
+      .overrideProvider(getRepositoryToken(Group))
+      .useValue({})
+      .overrideProvider(getRepositoryToken(LockedPlan))
+      .useValue({})
+      .overrideProvider(getRepositoryToken(Goal))
       .useValue({})
       .compile();
   });
